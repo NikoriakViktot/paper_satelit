@@ -25,7 +25,12 @@ class Embedder:
         logger.info("Loading embedding model: %s (device=%s)", model_name, device)
         self.model = SentenceTransformer(model_name, device=device)
         self.model_name = model_name
-        self.dimension = self.model.get_sentence_embedding_dimension()
+        get_dim = getattr(
+            self.model,
+            "get_embedding_dimension",
+            self.model.get_sentence_embedding_dimension,
+        )
+        self.dimension = get_dim()
         logger.info("Embedding dimension: %d", self.dimension)
 
     def embed_chunks(
