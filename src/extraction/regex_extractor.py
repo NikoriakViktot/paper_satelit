@@ -116,6 +116,11 @@ _REGION_PATTERN = _r(
 )
 
 
+# ── Bibliographic field patterns ─────────────────────────────────────────────
+
+_ABSTRACT_HEADER = re.compile(r"\bAbstract\b\s*[:\-—]?\s*", re.IGNORECASE)
+_DOI_RE          = re.compile(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+")
+
 # ── Author heuristics ─────────────────────────────────────────────────────────
 
 # "Smith et al. (2024)" or "Smith, J., & Jones, K. (2023)"
@@ -123,6 +128,34 @@ _AUTHOR_PATTERN = _r(
     r"^([A-Z][a-zA-ZÀ-ɏ\-]+(?:\s+[A-Z][a-zA-ZÀ-ɏ\-]+)?"
     r"(?:\s+et\s+al\.?)?)\s*[,\(]?\s*(?:19|20)\d{2}"
 )
+
+
+# ── Bibliographic field extractors ───────────────────────────────────────────
+
+def _extract_title(text: str, source_file: str) -> str:
+    for line in text[:600].splitlines():
+        line = line.strip()
+        if 10 < len(line) < 200 and not line.lower().startswith(
+            ("abstract", "introduction", "doi", "http", "www", "©", "keywords")
+        ):
+            return line
+    return source_file.replace(".pdf", "").replace("_", " ")
+
+
+def _extract_abstract(text: str) -> str:
+    m = _ABSTRACT_HEADER.search(text)
+    if not m:
+        return ""
+    after = text[m.end(): m.end() + 2000].strip()
+    # split on blank line or next-section indicator
+    paras = re.split(r"\n\s*\n|\n(?=[1-9A-Z][.\s])", after)
+    candidate = paras[0].strip() if paras else ""
+    return candidate[:1200]
+
+
+def _extract_doi(text: str) -> str:
+    m = _DOI_RE.search(text[:3000])
+    return m.group(0) if m else ""
 
 
 # ── Main extractor class ───────────────────────────────────────────────────────
@@ -150,6 +183,11 @@ class RegexExtractor(BaseExtractor):
         result.sensor = _detect_sensors(combined)
         result.region = _detect_region(combined)
         result.author = _detect_author(combined, source_file)
+
+        result.title     = _extract_title(combined, source_file)
+        result.abstract  = _extract_abstract(combined)
+        result.doi       = _extract_doi(combined)
+        result.full_text = combined
 
         result.accuracy_desc = _build_desc(result)
         result.evidence = _collect_evidence(combined)

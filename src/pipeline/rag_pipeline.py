@@ -20,6 +20,12 @@ from src.extraction.ollama_extractor import OllamaExtractor
 from src.extraction.regex_extractor import RegexExtractor
 from src.ingestion.pdf_reader import read_all_pdfs
 from src.processing.chunker import chunk_documents
+from src.processing.metadata_cleaner import (
+    apply_consistency_filter,
+    clean_metadata_df,
+    normalize_fields_df,
+    print_report,
+)
 from src.retrieval.retriever import Retriever
 from src.vectorstore.chroma_store import VectorStore
 
@@ -146,30 +152,50 @@ class RAGPipeline:
 # ── Post-processing ───────────────────────────────────────────────────────────
 
 _OUTPUT_COLUMNS = [
-    "Author", "Method", "Sensor", "Region",
+    "Source_File", "Title", "Authors", "DOI", "DOI_Valid",
+    "Abstract", "Abstract_Valid",
+    "Method", "Sensor", "Region",
     "OA", "F1", "IoU", "Kappa",
     "Accuracy_Level", "Accuracy_Desc",
-    "Source_File", "Confidence",
+    "Missing_Data_Explanation",
+    "Confidence", "Extraction_Score",
 ]
 
 
 def _post_process(df: pd.DataFrame) -> pd.DataFrame:
-    # ensure all expected columns exist
+    # 1. validate Abstract/DOI — needs Full_Text, adds _Valid columns
+    df = clean_metadata_df(df)
+
+    # 2. normalize Method/Sensor/Region + force region from Full_Text
+    df = normalize_fields_df(df)
+
+    # 3. drop Full_Text before column filtering (too large for CSV)
+    df = df.drop(columns=["Full_Text"], errors="ignore")
+
+    # 4. score rows and drop low-quality entries
+    df = apply_consistency_filter(df, min_score=2)
+
+    # 5. ensure all output columns exist, then select them
     for col in _OUTPUT_COLUMNS:
         if col not in df.columns:
             df[col] = None
-
     df = df[_OUTPUT_COLUMNS].copy()
 
-    # replace empty strings with NaN
-    str_cols = ["Author", "Method", "Sensor", "Region", "Accuracy_Desc"]
+    # 6. replace empty strings with None
+    str_cols = [
+        "Title", "Authors", "DOI", "Abstract",
+        "Method", "Sensor", "Region", "Accuracy_Desc",
+        "Missing_Data_Explanation",
+    ]
     for col in str_cols:
-        df[col] = df[col].replace("", None)
+        if col in df.columns:
+            df[col] = df[col].replace("", None)
 
-    # sort: Quantitative → Semi → Qualitative, then by OA desc
+    # 7. sort: Quantitative → Semi → Qualitative, then OA desc
     level_order = {"Quantitative": 0, "Semi-quantitative": 1, "Qualitative": 2}
     df["_level_rank"] = df["Accuracy_Level"].map(level_order).fillna(3)
     df = df.sort_values(["_level_rank", "OA"], ascending=[True, False])
     df = df.drop(columns="_level_rank").reset_index(drop=True)
 
+    print_report(df)
     return df

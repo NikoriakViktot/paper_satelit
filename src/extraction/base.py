@@ -17,6 +17,15 @@ class ExtractionResult:
     sensor: str      = ""
     region: str      = ""
 
+    # bibliographic metadata
+    title:     str = ""
+    abstract:  str = ""
+    doi:       str = ""
+    full_text: str = ""
+
+    # scientific explanation for any field that could not be populated
+    missing_data_explanation: str = ""
+
     # numeric metrics (None = not found)
     oa:    float | None = None
     f1:    float | None = None
@@ -37,18 +46,23 @@ class ExtractionResult:
 
     def to_dict(self) -> dict:
         return {
-            "Author":         self.author,
-            "Method":         self.method,
-            "Sensor":         self.sensor,
-            "Region":         self.region,
-            "OA":             self.oa,
-            "F1":             self.f1,
-            "IoU":            self.iou,
-            "Kappa":          self.kappa,
-            "Accuracy_Level": self.accuracy_level,
-            "Accuracy_Desc":  self.accuracy_desc,
-            "Source_File":    self.source_file,
-            "Confidence":     round(self.confidence, 3),
+            "Source_File":               self.source_file,
+            "Title":                     self.title,
+            "Authors":                   self.author,
+            "DOI":                       self.doi,
+            "Abstract":                  self.abstract,
+            "Full_Text":                 self.full_text,
+            "Method":                    self.method,
+            "Sensor":                    self.sensor,
+            "Region":                    self.region,
+            "OA":                        self.oa,
+            "F1":                        self.f1,
+            "IoU":                       self.iou,
+            "Kappa":                     self.kappa,
+            "Accuracy_Level":            self.accuracy_level,
+            "Accuracy_Desc":             self.accuracy_desc,
+            "Missing_Data_Explanation":  self.missing_data_explanation,
+            "Confidence":                round(self.confidence, 3),
         }
 
     def _num_metrics(self) -> int:
