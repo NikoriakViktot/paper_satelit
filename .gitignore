@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Data — PDFs and large files are not committed
+data/
+data/literature/*.pdf
+data/literature/*.PDF
+*.tif
+*.nc
+*.h5
+*.parquet
+*.pdf
+
+# Vector store (auto-generated, can be large)
+.chromadb/
+
+# Outputs — CSV results are not committed by default
+outputs/*.csv
+
+# Logs
+*.log
+rag_pipeline.log
+
+# Model cache (sentence-transformers downloads here)
+.cache/
+models/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment variables
+.env
+.env.local

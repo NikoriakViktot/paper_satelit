@@ -1,0 +1,12 @@
+# ── Core pipeline ─────────────────────────────────────────────────────────────
+pymupdf>=1.24.0              # PDF ingestion (import fitz)
+sentence-transformers>=2.7.0 # local embeddings  (all-MiniLM-L6-v2)
+chromadb>=0.5.0              # local persistent vector store
+pandas>=2.1.0                # output DataFrame / CSV
+numpy>=1.26.0                # array operations
+
+# ── HTTP (for Ollama extractor — optional) ────────────────────────────────────
+requests>=2.31.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+tqdm>=4.66.0                 # progress bars (used internally by sentence-transformers)
