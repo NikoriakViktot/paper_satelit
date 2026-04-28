@@ -47,7 +47,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     opts.add_argument(
         "--extractor",
-        choices=["regex", "ollama"],
+        choices=["regex", "ollama", "section"],
         default="regex",
         help="Extraction backend (default: regex)",
     )
@@ -113,15 +113,21 @@ def main(argv: list[str] | None = None) -> int:
             print("\n" + "=" * 70)
             print(f"Extracted {len(df)} papers  →  {args.output}")
             print("=" * 70)
-            # concise preview
-            preview_cols = ["Author", "Method", "OA", "F1", "IoU", "Accuracy_Level"]
-            existing = [c for c in preview_cols if c in df.columns]
+            existing = [c for c in _PREVIEW_COLS if c in df.columns]
             print(df[existing].to_string(index=False, max_rows=25))
         except RuntimeError as exc:
             log.error(str(exc))
             exit_code = 1
 
     return exit_code
+
+
+# ── Preview columns shown after --query ───────────────────────────────────────
+
+_PREVIEW_COLS = [
+    "Authors", "Year", "Study_Type", "Satellite_Names", "Sensor_Type",
+    "Country", "Methods", "Near_Real_Time", "OA", "F1", "Confidence",
+]
 
 
 if __name__ == "__main__":

@@ -8,5 +8,8 @@ numpy>=1.26.0                # array operations
 # ── HTTP (for Ollama extractor — optional) ────────────────────────────────────
 requests>=2.31.0
 
+# ── Graph database (Neo4j — optional) ────────────────────────────────────────
+neo4j>=5.0.0                 # Python driver for Neo4j graph database
+
 # ── Utilities ─────────────────────────────────────────────────────────────────
 tqdm>=4.66.0                 # progress bars (used internally by sentence-transformers)

@@ -124,6 +124,44 @@ class VectorStore:
     def count(self) -> int:
         return self._collection.count()
 
+    def get_by_filename(self, filename: str) -> list[dict]:
+        """
+        Return ALL stored chunks for *filename*, sorted by page_start.
+        Used by SectionExtractor to reconstruct full document text.
+        """
+        results = self._collection.get(
+            where={"filename": filename},
+            include=["documents", "metadatas"],
+        )
+        hits = []
+        for doc, meta, cid in zip(
+            results.get("documents") or [],
+            results.get("metadatas") or [],
+            results.get("ids")       or [],
+        ):
+            hits.append({
+                "text":       doc,
+                "chunk_id":   cid,
+                "filename":   meta.get("filename", ""),
+                "page_start": meta.get("page_start", 0),
+                "page_end":   meta.get("page_end",   0),
+                "distance":   0.0,
+            })
+        hits.sort(key=lambda h: (h["page_start"], h["chunk_id"]))
+        return hits
+
+    def list_filenames(self) -> list[str]:
+        """Return sorted list of unique PDF filenames in the collection."""
+        results = self._collection.get(include=["metadatas"])
+        seen: set[str] = set()
+        names: list[str] = []
+        for meta in results.get("metadatas") or []:
+            fn = meta.get("filename", "")
+            if fn and fn not in seen:
+                seen.add(fn)
+                names.append(fn)
+        return sorted(names)
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 

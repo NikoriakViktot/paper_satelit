@@ -18,8 +18,10 @@ from src.embedding.embedder import Embedder
 from src.extraction.base import BaseExtractor, ExtractionResult
 from src.extraction.ollama_extractor import OllamaExtractor
 from src.extraction.regex_extractor import RegexExtractor
+from src.extraction.section_extractor import SectionExtractor
 from src.ingestion.pdf_reader import read_all_pdfs
 from src.processing.chunker import chunk_documents
+from src.processing.analytics import classify_geo_relevance
 from src.processing.metadata_cleaner import (
     apply_consistency_filter,
     clean_metadata_df,
@@ -37,7 +39,7 @@ class RAGPipeline:
 
     def __init__(
         self,
-        extractor_type: str = "regex",   # "regex" | "ollama"
+        extractor_type: str = "regex",   # "regex" | "ollama" | "section"
         data_dir: Path = DATA_DIR,
         output_csv: Path = OUTPUT_CSV,
     ) -> None:
@@ -45,29 +47,22 @@ class RAGPipeline:
         self._output_csv = Path(output_csv)
 
         logger.info("Initialising components …")
-        self._embedder = Embedder()
-        self._store    = VectorStore()
+        self._embedder  = Embedder()
+        self._store     = VectorStore()
         self._retriever = Retriever(self._store, self._embedder)
-        self._extractor: BaseExtractor = (
-            OllamaExtractor() if extractor_type == "ollama" else RegexExtractor()
-        )
+
+        if extractor_type == "ollama":
+            self._extractor: BaseExtractor = OllamaExtractor()
+        elif extractor_type == "section":
+            self._extractor = SectionExtractor()
+        else:
+            self._extractor = RegexExtractor()
+
         logger.info("Extractor: %s", type(self._extractor).__name__)
 
     # ── Ingest ────────────────────────────────────────────────────────────────
 
     def ingest(self, folder: Path | None = None, force: bool = False) -> int:
-        """
-        Read all PDFs from *folder*, embed, and upsert into ChromaDB.
-
-        Parameters
-        ----------
-        folder: override default DATA_DIR
-        force:  if True, clear existing collection before ingesting
-
-        Returns
-        -------
-        Number of chunks stored.
-        """
         folder = Path(folder) if folder else self._data_dir
         t0 = time.perf_counter()
 
@@ -113,16 +108,24 @@ class RAGPipeline:
         queries = queries or RETRIEVAL_QUERIES
         t0 = time.perf_counter()
 
-        by_file = self._retriever.retrieve_for_queries(queries=queries, top_k=top_k)
+        if isinstance(self._extractor, SectionExtractor):
+            logger.info("Section extractor active — fetching full document context.")
+            by_file = self._retriever.fetch_full_context()
+        else:
+            by_file = self._retriever.retrieve_for_queries(queries=queries, top_k=top_k)
 
         results: list[ExtractionResult] = []
         for filename, chunks in by_file.items():
             logger.info("Extracting from: %s (%d chunks)", filename, len(chunks))
             result = self._extractor.extract(chunks, source_file=filename)
             results.append(result)
+            if isinstance(self._extractor, SectionExtractor):
+                print(f"    Sections used:    {result.sections_used or '—'}")
             logger.debug(
-                "  → OA=%s  F1=%s  IoU=%s  Kappa=%s  Level=%s",
-                result.oa, result.f1, result.iou, result.kappa, result.accuracy_level,
+                "  → study_type=%s  satellite=%s  country=%s  methods=%s  "
+                "NRT=%s  OA=%s  F1=%s",
+                result.study_type, result.satellite_names, result.country,
+                result.methods, result.near_real_time, result.oa, result.f1,
             )
 
         df = pd.DataFrame([r.to_dict() for r in results])
@@ -152,22 +155,39 @@ class RAGPipeline:
 # ── Post-processing ───────────────────────────────────────────────────────────
 
 _OUTPUT_COLUMNS = [
-    "Source_File", "Title", "Authors", "DOI", "DOI_Valid",
+    "Source_File", "Title", "Authors", "DOI", "Year",
     "Abstract", "Abstract_Valid",
-    "Method", "Sensor", "Region",
-    "OA", "F1", "IoU", "Kappa",
-    "Accuracy_Level", "Accuracy_Desc",
+    "Study_Type",
+    "Satellite_Names", "Sensor_Type", "Data_Product",
+    "Geo_Relevance", "Ukraine_Relevance",
+    "Country", "Region", "River_Basin", "River_Name", "City_Event",
+    "Methods",
+    "OA", "F1", "IoU", "Kappa", "Metrics_Reported",
+    "Latency", "Revisit_Time", "Near_Real_Time",
+    "DOI_Valid",
     "Missing_Data_Explanation",
+    "Sections_Used",
     "Confidence", "Extraction_Score",
 ]
 
 
 def _post_process(df: pd.DataFrame) -> pd.DataFrame:
-    # 1. validate Abstract/DOI — needs Full_Text, adds _Valid columns
+    # 1. validate Abstract/DOI
     df = clean_metadata_df(df)
 
-    # 2. normalize Method/Sensor/Region + force region from Full_Text
+    # 2. normalize Sensor_Type / Methods / Study_Type + force-fill Country
     df = normalize_fields_df(df)
+
+    # 2b. Compute Geo_Relevance from all geographic fields
+    def _geo(row: pd.Series) -> str:
+        return classify_geo_relevance(
+            row.get("Country",           "") or "",
+            row.get("Region",            "") or "",
+            row.get("River_Basin",       "") or "",
+            row.get("River_Name",        "") or "",
+            bool(row.get("Ukraine_Relevance", False)),
+        )
+    df["Geo_Relevance"] = df.apply(_geo, axis=1)
 
     # 3. drop Full_Text before column filtering (too large for CSV)
     df = df.drop(columns=["Full_Text"], errors="ignore")
@@ -175,7 +195,7 @@ def _post_process(df: pd.DataFrame) -> pd.DataFrame:
     # 4. score rows and drop low-quality entries
     df = apply_consistency_filter(df, min_score=2)
 
-    # 5. ensure all output columns exist, then select them
+    # 5. ensure all output columns exist, then select
     for col in _OUTPUT_COLUMNS:
         if col not in df.columns:
             df[col] = None
@@ -183,19 +203,21 @@ def _post_process(df: pd.DataFrame) -> pd.DataFrame:
 
     # 6. replace empty strings with None
     str_cols = [
-        "Title", "Authors", "DOI", "Abstract",
-        "Method", "Sensor", "Region", "Accuracy_Desc",
-        "Missing_Data_Explanation",
+        "Title", "Authors", "DOI", "Year", "Abstract",
+        "Study_Type", "Satellite_Names", "Sensor_Type", "Data_Product",
+        "Geo_Relevance", "Country", "Region", "River_Basin", "River_Name", "City_Event",
+        "Methods", "Latency", "Revisit_Time", "Missing_Data_Explanation",
     ]
     for col in str_cols:
         if col in df.columns:
             df[col] = df[col].replace("", None)
 
-    # 7. sort: Quantitative → Semi → Qualitative, then OA desc
-    level_order = {"Quantitative": 0, "Semi-quantitative": 1, "Qualitative": 2}
-    df["_level_rank"] = df["Accuracy_Level"].map(level_order).fillna(3)
-    df = df.sort_values(["_level_rank", "OA"], ascending=[True, False])
-    df = df.drop(columns="_level_rank").reset_index(drop=True)
+    # 7. sort: Near_Real_Time first, then by number of metrics, then confidence
+    df["_nrt_rank"]   = df["Near_Real_Time"].apply(lambda v: 0 if v is True else 1)
+    df["_metric_cnt"] = df[["OA", "F1", "IoU", "Kappa"]].notna().sum(axis=1)
+    df = df.sort_values(["_nrt_rank", "_metric_cnt", "Confidence"],
+                        ascending=[True, False, False])
+    df = df.drop(columns=["_nrt_rank", "_metric_cnt"]).reset_index(drop=True)
 
     print_report(df)
     return df

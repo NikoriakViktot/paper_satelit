@@ -53,6 +53,22 @@ class Retriever:
         )
         return dict(by_file)
 
+    def fetch_full_context(self) -> dict[str, list[dict]]:
+        """
+        Return ALL stored chunks for every file, each list sorted by page order.
+        Used by SectionExtractor to reconstruct full document text per paper.
+        """
+        filenames = self._store.list_filenames()
+        logger.info("Fetching full context for %d files …", len(filenames))
+        by_file: dict[str, list[dict]] = {}
+        for fn in filenames:
+            chunks = self._store.get_by_filename(fn)
+            if chunks:
+                by_file[fn] = chunks
+        total = sum(len(v) for v in by_file.values())
+        logger.info("Full context: %d chunks across %d files", total, len(by_file))
+        return by_file
+
     def retrieve_for_file(
         self,
         filename: str,

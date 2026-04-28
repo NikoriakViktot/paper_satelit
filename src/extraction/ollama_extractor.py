@@ -6,7 +6,7 @@ or returns unparseable output.
 
 Usage (requires Ollama running):
     $ ollama pull llama3.2
-    $ ollama serve          # already running as a service after install
+    $ ollama serve
 """
 from __future__ import annotations
 
@@ -25,16 +25,19 @@ from src.extraction.regex_extractor import RegexExtractor
 logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = textwrap.dedent("""\
-    You are a scientific data completion and interpretation system for flood mapping literature.
-    Your role: extract what is present, explain what is missing — never invent values.
+    You are a scientific data extraction system for satellite-based flood mapping literature.
+    Your role: extract what is present — never invent values.
     Always reply with valid JSON only — no prose, no markdown fences.
     Numeric accuracy values must be on a 0–1 scale (e.g. 0.95, not 95).
-    NEVER hallucinate methods, sensors, regions, or numeric metrics.
+    NEVER hallucinate satellite names, methods, regions, or numeric metrics.
 """)
 
 _USER_TEMPLATE = textwrap.dedent("""\
-    Review the paper below and return a JSON object with these exact keys:
-      Method, Sensor, Region, OA, F1, IoU, Accuracy_Description, Missing_Data_Explanation
+    Review the paper below and return a JSON object with exactly these keys:
+      Study_Type, Satellite_Names, Sensor_Type, Data_Product,
+      Country, Region, River_Basin, City_Event, Methods,
+      OA, F1, IoU, Kappa, Near_Real_Time, Latency,
+      Missing_Data_Explanation
 
     INPUT:
     TITLE: {title}
@@ -42,69 +45,63 @@ _USER_TEMPLATE = textwrap.dedent("""\
 
     FIELD RULES:
 
-    Method:
-    - Extract specific model name if present: U-Net, Random Forest, CNN, SVM, etc.
-    - If only a generic phrase: return it (e.g. "deep learning")
-    - If absent: return exactly "Method not explicitly specified in abstract"
+    Study_Type:
+    - One of: "Satellite flood mapping" | "ML/DL classification" |
+      "Hydrological forecasting" | "Hydraulic modeling" |
+      "Operational mapping system" | "Review paper" | "Dataset/benchmark paper"
 
-    Sensor:
-    - Infer from keywords: SAR / Sentinel-1 → "SAR"; Sentinel-2 / Landsat → "Optical"
-    - Both present → "Multi"
-    - If absent: return exactly "Sensor type not reported"
+    Satellite_Names:
+    - Comma-separated list of satellite/sensor names found
+      (e.g. "Sentinel-1, Sentinel-2"); null if absent
+
+    Sensor_Type:
+    - "SAR" | "Optical" | "Multi-sensor"; null if absent
+
+    Data_Product:
+    - Data product codes e.g. "GRD", "MSI", "OLI"; null if absent
+
+    Country:
+    - Country name; if Ukraine mentioned → "Ukraine"; null if absent
 
     Region:
-    - Priority: country > sub-region > basin/river
-    - If Ukraine mentioned anywhere → return exactly "Ukraine"
-    - If absent: return exactly "Study area not specified"
+    - Sub-national area, continent, or geographic region; null if absent
 
-    OA / F1 / IoU:
-    - Float 0–1, or null
-    - Range (0.84–0.95) → return mean
-    - Extract ONLY if an explicit number is present — NEVER guess
-    - "high accuracy" → null (not numeric)
+    River_Basin:
+    - River or basin name; null if absent
 
-    Accuracy_Description:
-    - If numeric metrics present → null
-    - If no metrics but qualitative phrases exist → extract them verbatim
-      (e.g. "high accuracy", "validated against ground truth")
-    - If neither → return exactly "Study reports qualitative validation without explicit quantitative metrics"
+    City_Event:
+    - Specific city or named flood event; null if absent
+
+    Methods:
+    - Comma-separated list of methods found from:
+        Thresholding | Change detection | NDWI/MNDWI | Random Forest | SVM |
+        Maximum likelihood | U-Net | CNN | LSTM | Transformer | OBIA |
+        Hydrodynamic model | Operational workflow
+    - null if absent
+
+    OA / F1 / IoU / Kappa:
+    - Float 0–1; range (0.84–0.95) → mean; null if not explicitly stated
+    - Only extract if paper is about classification/mapping accuracy
+
+    Near_Real_Time:
+    - true | false | null
+
+    Latency:
+    - String like "<6 h" or "1–3 days"; null if absent
 
     Missing_Data_Explanation:
-    - Concise scientific sentence listing which fields are absent and why
-    - Example: "OA, F1, IoU not reported; method described generically; study area inferred from context."
-    - If nothing is missing → return null
+    - One sentence listing fields that could not be extracted and why; null if complete
 
     Return valid JSON only.
 """)
 
 _FALLBACK = RegexExtractor()
 
-# Known explanation-string prefixes the LLM is instructed to return
-_EXPLANATION_MARKERS = (
-    "method not explicitly",
-    "sensor type not",
-    "study area not",
-    "study reports qualitative",
-    "no information",
-    "not reported",
-    "not specified",
-    "not explicitly",
-    "not determinable",
-)
-
-
-def _is_explanation(text: str) -> bool:
-    """Return True when the LLM returned an explanation rather than a data value."""
-    if not text:
-        return False
-    lower = text.lower()
-    return any(marker in lower for marker in _EXPLANATION_MARKERS) or len(text) > 80
-
 
 class OllamaExtractor(BaseExtractor):
     """
     LLM-backed extractor using Ollama's /api/generate endpoint.
-    Input is title + abstract (not full text) for focused, reliable extraction.
+    Input is title + abstract for focused, reliable extraction.
     Falls back to RegexExtractor on any error.
     """
 
@@ -126,7 +123,6 @@ class OllamaExtractor(BaseExtractor):
         chunks: list[dict],
         source_file: str,
     ) -> ExtractionResult:
-        # always run regex first: supplies title/abstract for LLM and fills gaps
         regex_result = _FALLBACK.extract(chunks, source_file)
 
         if not self._is_available():
@@ -173,27 +169,23 @@ class OllamaExtractor(BaseExtractor):
             "system": _SYSTEM_PROMPT,
             "stream": False,
             "format": "json",
-            "options": {"temperature": 0.0, "num_predict": 400},
+            "options": {"temperature": 0.0, "num_predict": 500},
         }
         resp = requests.post(self._url, json=payload, timeout=self._timeout)
         resp.raise_for_status()
         return resp.json().get("response", "")
 
-    def _parse_response(
-        self,
-        raw: str,
-        source_file: str,
-    ) -> ExtractionResult:
+    def _parse_response(self, raw: str, source_file: str) -> ExtractionResult:
         raw = re.sub(r"```(?:json)?", "", raw).strip()
         data: dict[str, Any] = json.loads(raw)
 
-        def _raw_str(key: str) -> str:
+        def _s(key: str) -> str:
             val = data.get(key) or data.get(key.lower())
-            return str(val).strip() if val else ""
+            return str(val).strip() if val and str(val) != "null" else ""
 
-        def _float(key: str) -> float | None:
+        def _f(key: str) -> float | None:
             val = data.get(key) or data.get(key.lower())
-            if val is None:
+            if val is None or str(val) == "null":
                 return None
             try:
                 num = float(val)
@@ -201,48 +193,37 @@ class OllamaExtractor(BaseExtractor):
             except (TypeError, ValueError):
                 return None
 
-        method_raw  = _raw_str("Method")
-        sensor_raw  = _raw_str("Sensor")
-        region_raw  = _raw_str("Region")
-        acc_raw     = _raw_str("Accuracy_Description")
-        mde_raw     = _raw_str("Missing_Data_Explanation")
-
-        # Separate real values from explanation strings.
-        # Explanation strings are routed to missing_data_explanation so that
-        # the categorical fields stay clean for downstream normalisation.
-        method, sensor, region = (
-            ("" if _is_explanation(method_raw) else method_raw),
-            ("" if _is_explanation(sensor_raw) else sensor_raw),
-            ("" if _is_explanation(region_raw) else region_raw),
-        )
-
-        # Collect per-field explanations that were rerouted
-        rerouted = [
-            v for v in (
-                method_raw if _is_explanation(method_raw) else "",
-                sensor_raw if _is_explanation(sensor_raw) else "",
-                region_raw if _is_explanation(region_raw) else "",
-            ) if v
-        ]
-        if rerouted and not mde_raw:
-            mde_raw = " | ".join(rerouted)
-        elif rerouted:
-            mde_raw = mde_raw + " | " + " | ".join(rerouted)
-
-        # Standard accuracy fallback when no description was generated
-        if not acc_raw and not any([_float("OA"), _float("F1"), _float("IoU")]):
-            acc_raw = "Study reports qualitative validation without explicit quantitative metrics"
+        def _b(key: str) -> bool | None:
+            val = data.get(key) or data.get(key.lower())
+            if val is None or str(val) == "null":
+                return None
+            if isinstance(val, bool):
+                return val
+            s = str(val).lower()
+            if s in ("true", "yes", "1"):
+                return True
+            if s in ("false", "no", "0"):
+                return False
+            return None
 
         return ExtractionResult(
             source_file              = source_file,
-            method                   = method,
-            sensor                   = sensor,
-            region                   = region,
-            oa                       = _float("OA"),
-            f1                       = _float("F1"),
-            iou                      = _float("IoU"),
-            accuracy_desc            = acc_raw,
-            missing_data_explanation = mde_raw,
+            study_type               = _s("Study_Type"),
+            satellite_names          = _s("Satellite_Names"),
+            sensor_type              = _s("Sensor_Type"),
+            data_product             = _s("Data_Product"),
+            country                  = _s("Country"),
+            region                   = _s("Region"),
+            river_basin              = _s("River_Basin"),
+            city_event               = _s("City_Event"),
+            methods                  = _s("Methods"),
+            oa                       = _f("OA"),
+            f1                       = _f("F1"),
+            iou                      = _f("IoU"),
+            kappa                    = _f("Kappa"),
+            near_real_time           = _b("Near_Real_Time"),
+            latency                  = _s("Latency"),
+            missing_data_explanation = _s("Missing_Data_Explanation"),
             confidence               = 0.85,
         )
 
@@ -253,24 +234,31 @@ def _fill_from_regex(
     llm: ExtractionResult,
     regex: ExtractionResult,
 ) -> ExtractionResult:
-    """Fill any blank LLM fields with values from the regex pass."""
-    if not llm.oa     and regex.oa:     llm.oa     = regex.oa
-    if not llm.f1     and regex.f1:     llm.f1     = regex.f1
-    if not llm.iou    and regex.iou:    llm.iou    = regex.iou
-    if not llm.kappa  and regex.kappa:  llm.kappa  = regex.kappa
-    if not llm.method and regex.method: llm.method = regex.method
-    if not llm.sensor and regex.sensor: llm.sensor = regex.sensor
-    if not llm.region and regex.region: llm.region = regex.region
-    if not llm.author and regex.author: llm.author = regex.author
+    """Fill blank LLM fields with regex values."""
+    scalar_fields = (
+        "study_type", "satellite_names", "sensor_type", "data_product",
+        "country", "region", "river_basin", "city_event", "methods",
+        "near_real_time", "latency", "revisit_time",
+        "oa", "f1", "iou", "kappa",
+    )
+    for field in scalar_fields:
+        if not getattr(llm, field, None) and getattr(regex, field, None):
+            setattr(llm, field, getattr(regex, field))
 
-    # bibliographic fields come exclusively from regex
+    # bibliographic fields always come from regex
     llm.title     = regex.title
     llm.abstract  = regex.abstract
     llm.doi       = regex.doi
+    llm.year      = regex.year
+    llm.authors   = regex.authors
     llm.full_text = regex.full_text
     llm.evidence  = regex.evidence
 
-    # preserve any explanation the LLM produced; don't overwrite with regex blank
+    # Geography fields derived from keyword scan — always use regex
+    llm.ukraine_relevance = regex.ukraine_relevance
+    if not llm.river_name:
+        llm.river_name = regex.river_name or regex.river_basin
+
     if not llm.missing_data_explanation and regex.missing_data_explanation:
         llm.missing_data_explanation = regex.missing_data_explanation
 

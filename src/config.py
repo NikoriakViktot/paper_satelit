@@ -28,12 +28,14 @@ COLLECTION_NAME = os.getenv("COLLECTION_NAME", "flood_papers")
 RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "12"))
 
 RETRIEVAL_QUERIES = [
-    "flood mapping accuracy OA F1 IoU Kappa overall accuracy",
-    "remote sensing flood detection sensor method classification accuracy",
-    "SAR Sentinel-1 flood mapping accuracy performance",
-    "deep learning U-Net CNN flood segmentation F1 IoU",
-    "random forest SVM machine learning flood overall accuracy Kappa",
-    "optical satellite flood mapping Sentinel-2 Landsat accuracy",
+    "flood mapping satellite remote sensing sensor study area method",
+    "SAR Sentinel-1 flood detection thresholding change detection backscatter",
+    "Sentinel-2 Landsat optical flood mapping NDWI MNDWI water index",
+    "near-real-time operational flood monitoring latency revisit time",
+    "U-Net CNN deep learning flood segmentation classification",
+    "hydrological hydrodynamic hydraulic model flood simulation HEC-RAS LISFLOOD",
+    "flood extent mapping accuracy validation OA F1 IoU Kappa",
+    "flood event study area country region river basin city",
 ]
 
 # ── LLM (Ollama) ──────────────────────────────────────────────────────────────
