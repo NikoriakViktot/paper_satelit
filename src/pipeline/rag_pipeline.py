@@ -16,8 +16,10 @@ import pandas as pd
 from src.config import DATA_DIR, OUTPUT_CSV, RETRIEVAL_QUERIES, RETRIEVAL_TOP_K
 from src.embedding.embedder import Embedder
 from src.extraction.base import BaseExtractor, ExtractionResult
+from src.extraction.models import FactExtractionResult
 from src.extraction.ollama_extractor import OllamaExtractor
 from src.extraction.regex_extractor import RegexExtractor
+from src.extraction.scientific_extractor import ScientificExtractor
 from src.extraction.section_extractor import SectionExtractor
 from src.ingestion.pdf_reader import read_all_pdfs
 from src.processing.chunker import chunk_documents
@@ -55,6 +57,8 @@ class RAGPipeline:
             self._extractor: BaseExtractor = OllamaExtractor()
         elif extractor_type == "section":
             self._extractor = SectionExtractor()
+        elif extractor_type == "scientific":
+            self._extractor = ScientificExtractor()
         else:
             self._extractor = RegexExtractor()
 
@@ -100,7 +104,8 @@ class RAGPipeline:
 
         Returns
         -------
-        DataFrame with columns matching ExtractionResult.to_dict()
+        DataFrame with columns matching ExtractionResult.to_dict() plus
+        post-processing columns (Geo_Relevance, Extraction_Score, etc.)
         """
         if self._store.count() == 0:
             raise RuntimeError("Vector store is empty — run --ingest first.")
@@ -115,18 +120,35 @@ class RAGPipeline:
             by_file = self._retriever.retrieve_for_queries(queries=queries, top_k=top_k)
 
         results: list[ExtractionResult] = []
+        rejected_count = 0
+
         for filename, chunks in by_file.items():
             logger.info("Extracting from: %s (%d chunks)", filename, len(chunks))
             result = self._extractor.extract(chunks, source_file=filename)
-            results.append(result)
+
+            # ── Validation layer (Task 8) ─────────────────────────────────────
+            is_valid, reason = _validate_extraction(result)
+            if not is_valid:
+                logger.warning("[VALIDATION REJECTED] %s: %s", filename, reason)
+                print(f"  [REJECTED] {filename}: {reason}")
+                result.missing_data_explanation = f"VALIDATION: {reason}"
+                result.confidence = 0.0
+                rejected_count += 1
+
             if isinstance(self._extractor, SectionExtractor):
                 print(f"    Sections used:    {result.sections_used or '—'}")
+
             logger.debug(
                 "  → study_type=%s  satellite=%s  country=%s  methods=%s  "
-                "NRT=%s  OA=%s  F1=%s",
+                "NRT=%s  OA=%s  F1=%s  mode=%s",
                 result.study_type, result.satellite_names, result.country,
                 result.methods, result.near_real_time, result.oa, result.f1,
+                result.extractor_mode,
             )
+            results.append(result)
+
+        if rejected_count:
+            logger.info("Validation rejected %d / %d papers.", rejected_count, len(results))
 
         df = pd.DataFrame([r.to_dict() for r in results])
         df = _post_process(df)
@@ -151,6 +173,116 @@ class RAGPipeline:
         chunks = self._retriever.retrieve_for_file(filename)
         return self._extractor.extract(chunks, source_file=filename)
 
+    # ── Fact-centric extraction ───────────────────────────────────────────────
+
+    def query_facts(
+        self,
+        write_graph: bool = False,
+        save_json: bool = True,
+    ) -> list[FactExtractionResult]:
+        """
+        Run the fact-centric extraction pipeline.
+
+        For each PDF in the vector store, extracts structured ScientificFact
+        objects with full Evidence provenance, then optionally writes them to
+        Neo4j and/or saves a JSON file.
+
+        Returns
+        -------
+        list[FactExtractionResult]
+        """
+        if self._store.count() == 0:
+            raise RuntimeError("Vector store is empty — run --ingest first.")
+
+        if not isinstance(self._extractor, ScientificExtractor):
+            logger.warning(
+                "query_facts() requires ScientificExtractor.  "
+                "Switching automatically."
+            )
+            self._extractor = ScientificExtractor()
+
+        t0 = time.perf_counter()
+        by_file = self._retriever.fetch_full_context()
+
+        fact_results: list[FactExtractionResult] = []
+
+        for filename, chunks in by_file.items():
+            logger.info("Fact extraction from: %s (%d chunks)", filename, len(chunks))
+            fact_result = self._extractor.extract_facts(chunks, source_file=filename)
+            fact_results.append(fact_result)
+
+        elapsed = time.perf_counter() - t0
+        total_facts = sum(r.fact_count for r in fact_results)
+        total_rejected = sum(len(r.rejected_facts) for r in fact_results)
+        logger.info(
+            "Fact extraction complete in %.1f s — %d papers, %d facts, %d rejected.",
+            elapsed, len(fact_results), total_facts, total_rejected,
+        )
+
+        if write_graph:
+            from src.graphstore.neo4j_writer import Neo4jWriter
+            with Neo4jWriter() as gdb:
+                gdb.write_fact_papers(fact_results)
+
+        if save_json:
+            import json
+            out_path = self._output_csv.with_suffix(".facts.json")
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    [r.to_dict() for r in fact_results],
+                    fh,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            logger.info("Facts JSON saved → %s", out_path)
+
+        return fact_results
+
+
+# ── Validation layer (Task 8) ─────────────────────────────────────────────────
+
+def _validate_extraction(result: ExtractionResult) -> tuple[bool, str]:
+    """
+    Hard validation rules (Task 8).
+
+    Returns (is_valid, rejection_reason).
+    A result is invalid if:
+      - Metrics have explicit wrong-section provenance
+      - Methods have explicit wrong-section provenance
+      - Country is the generic string "study area"
+    """
+    provenance = result.provenance or {}
+
+    # Rule 1: metrics must come from results section
+    for field_name, attr in [("OA","oa"),("F1","f1"),("IoU","iou"),("Kappa","kappa")]:
+        value = getattr(result, attr, None)
+        prov  = provenance.get(field_name, {})
+        # Only fail when provenance explicitly shows the WRONG section
+        if value is not None and prov.get("section") and prov["section"] != "results":
+            return False, (
+                f"{field_name}={value} was extracted from '{prov['section']}' "
+                f"but must come from 'results' section"
+            )
+
+    # Rule 2: methods must come from methods section
+    methods_prov = provenance.get("Methods", {})
+    if (result.methods
+            and methods_prov.get("section")
+            and methods_prov["section"] not in ("methods", "abstract+methods")):
+        return False, (
+            f"Methods were extracted from '{methods_prov['section']}' "
+            f"but must come from 'methods' section"
+        )
+
+    # Rule 3: country == "study area" is not informative
+    if result.country:
+        norm = result.country.lower().strip().rstrip(".")
+        if norm in ("study area", "the study area", "study region"):
+            return False, f"Country field is generic '{result.country}' — not a real country"
+
+    return True, ""
+
 
 # ── Post-processing ───────────────────────────────────────────────────────────
 
@@ -167,18 +299,24 @@ _OUTPUT_COLUMNS = [
     "DOI_Valid",
     "Missing_Data_Explanation",
     "Sections_Used",
+    # Task 7: extraction mode flags
+    "Extractor_Mode", "LLM_Used", "Fallback_Used",
+    # Task 6: quality scores
+    "Quality_Score", "Evidence_Score",
+    # Task 3: provenance summary
+    "Provenance_JSON",
     "Confidence", "Extraction_Score",
 ]
 
 
 def _post_process(df: pd.DataFrame) -> pd.DataFrame:
-    # 1. validate Abstract/DOI
+    # 1. Validate Abstract / DOI
     df = clean_metadata_df(df)
 
-    # 2. normalize Sensor_Type / Methods / Study_Type + force-fill Country
+    # 2. Normalize Sensor_Type / Methods / Study_Type + force-fill Country
     df = normalize_fields_df(df)
 
-    # 2b. Compute Geo_Relevance from all geographic fields
+    # 2b. Geo_Relevance from all geographic fields
     def _geo(row: pd.Series) -> str:
         return classify_geo_relevance(
             row.get("Country",           "") or "",
@@ -189,30 +327,31 @@ def _post_process(df: pd.DataFrame) -> pd.DataFrame:
         )
     df["Geo_Relevance"] = df.apply(_geo, axis=1)
 
-    # 3. drop Full_Text before column filtering (too large for CSV)
+    # 3. Drop Full_Text before column filtering (too large for CSV)
     df = df.drop(columns=["Full_Text"], errors="ignore")
 
-    # 4. score rows and drop low-quality entries
+    # 4. Score rows and drop low-quality entries
     df = apply_consistency_filter(df, min_score=2)
 
-    # 5. ensure all output columns exist, then select
+    # 5. Ensure all output columns exist, then select
     for col in _OUTPUT_COLUMNS:
         if col not in df.columns:
             df[col] = None
     df = df[_OUTPUT_COLUMNS].copy()
 
-    # 6. replace empty strings with None
+    # 6. Replace empty strings with None in string columns
     str_cols = [
         "Title", "Authors", "DOI", "Year", "Abstract",
         "Study_Type", "Satellite_Names", "Sensor_Type", "Data_Product",
         "Geo_Relevance", "Country", "Region", "River_Basin", "River_Name", "City_Event",
         "Methods", "Latency", "Revisit_Time", "Missing_Data_Explanation",
+        "Extractor_Mode", "Provenance_JSON",
     ]
     for col in str_cols:
         if col in df.columns:
             df[col] = df[col].replace("", None)
 
-    # 7. sort: Near_Real_Time first, then by number of metrics, then confidence
+    # 7. Sort: Near_Real_Time first, then metric count, then confidence
     df["_nrt_rank"]   = df["Near_Real_Time"].apply(lambda v: 0 if v is True else 1)
     df["_metric_cnt"] = df[["OA", "F1", "IoU", "Kappa"]].notna().sum(axis=1)
     df = df.sort_values(["_nrt_rank", "_metric_cnt", "Confidence"],

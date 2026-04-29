@@ -22,32 +22,28 @@ class ExtractionResult:
     full_text: str = ""
 
     # ── Study type ────────────────────────────────────────────────────────────
-    # Satellite flood mapping | ML/DL classification | Hydrological forecasting
-    # Hydraulic modeling | Operational mapping system | Review paper
-    # Dataset/benchmark paper
     study_type: str = ""
 
     # ── Satellite / sensor ────────────────────────────────────────────────────
-    satellite_names: str = ""    # comma-separated, e.g. "Sentinel-1, Sentinel-2"
+    satellite_names: str = ""    # comma-separated
     sensor_type:     str = ""    # SAR | Optical | Multi-sensor
-    data_product:    str = ""    # GRD, MSI, OLI, …
+    data_product:    str = ""
 
     # ── Study area ────────────────────────────────────────────────────────────
     country:     str = ""
-    region:      str = ""        # sub-national area, basin region, or continent
+    region:      str = ""
     river_basin: str = ""
-    river_name:  str = ""        # specific river name(s), comma-separated
+    river_name:  str = ""
     city_event:  str = ""
 
     # ── Geographic relevance ──────────────────────────────────────────────────
-    # Ukraine-specific | Eastern Europe | Europe | Global | Other region | Unspecified
     geo_relevance:     str  = ""
     ukraine_relevance: bool = False
 
     # ── Method / processing ───────────────────────────────────────────────────
     methods: str = ""            # comma-separated list
 
-    # ── Metrics (optional — only when explicitly reported) ────────────────────
+    # ── Metrics ───────────────────────────────────────────────────────────────
     oa:    float | None = None
     f1:    float | None = None
     iou:   float | None = None
@@ -55,9 +51,24 @@ class ExtractionResult:
     metrics_reported: bool = False
 
     # ── Timeliness ────────────────────────────────────────────────────────────
-    latency:        str         = ""    # e.g. "<6 h", "1–3 days"
-    revisit_time:   str         = ""    # e.g. "6 days (Sentinel-1)"
+    latency:        str         = ""
+    revisit_time:   str         = ""
     near_real_time: bool | None = None
+
+    # ── Provenance (Task 3) ───────────────────────────────────────────────────
+    # field_name → {section, snippet, source, extractor_mode, value}
+    provenance: dict = field(default_factory=dict)
+
+    # ── Extraction mode flags (Task 7) ────────────────────────────────────────
+    extractor_mode: str  = ""     # "section" | "fallback" | "mixed"
+    llm_used:       bool = False
+    fallback_used:  bool = False
+
+    # ── Quality scores (Task 6) ───────────────────────────────────────────────
+    # quality_score: structural completeness (title, abstract, methods, results, satellite)
+    # evidence_score: count of fields with valid section-based provenance
+    quality_score:  float = 0.0
+    evidence_score: int   = 0
 
     # ── QA ────────────────────────────────────────────────────────────────────
     confidence:               float     = 0.0
@@ -96,7 +107,16 @@ class ExtractionResult:
             "Near_Real_Time":            self.near_real_time,
             "Missing_Data_Explanation":  self.missing_data_explanation,
             "Sections_Used":             ", ".join(self.sections_used) if self.sections_used else "",
+            # Task 7: extraction mode flags
+            "Extractor_Mode":            self.extractor_mode,
+            "LLM_Used":                  self.llm_used,
+            "Fallback_Used":             self.fallback_used,
+            # Task 6: quality scores
+            "Quality_Score":             round(self.quality_score, 3),
+            "Evidence_Score":            self.evidence_score,
             "Confidence":                round(self.confidence, 3),
+            # Task 3: provenance (JSON string — nested dict not flat-CSV-safe)
+            "Provenance_JSON":           _provenance_summary(self.provenance),
         }
 
     def _num_metrics(self) -> int:
@@ -105,7 +125,25 @@ class ExtractionResult:
     def finalize(self) -> "ExtractionResult":
         """Compute derived fields before returning."""
         self.metrics_reported = self._num_metrics() > 0
+        # evidence_score = fields that have section-level provenance with a snippet
+        self.evidence_score = sum(
+            1 for v in self.provenance.values()
+            if isinstance(v, dict) and v.get("section") and v.get("snippet")
+        )
         return self
+
+
+def _provenance_summary(provenance: dict) -> str:
+    """Compact single-line summary of field→section mapping for CSV storage."""
+    if not provenance:
+        return ""
+    parts = []
+    for field_name, prov in provenance.items():
+        if isinstance(prov, dict):
+            section = prov.get("section", "?")
+            source  = prov.get("source", "?")
+            parts.append(f"{field_name}@{section}[{source}]")
+    return "; ".join(parts)
 
 
 class BaseExtractor(ABC):

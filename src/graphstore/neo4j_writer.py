@@ -1,17 +1,25 @@
 """
 Neo4j writer for the flood mapping extraction pipeline.
 
-Converts ExtractionResult objects into graph nodes and relationships
-using the schema defined in neo4j_schema.cypher.
+Two write paths:
 
-Usage
------
-    from src.graphstore.neo4j_writer import Neo4jWriter
+  Legacy (flat)   — write_paper(ExtractionResult)
+  Fact-centric    — write_fact_paper(FactExtractionResult)
 
-    with Neo4jWriter() as gdb:
-        gdb.seed_vocabulary()          # run once on a fresh database
-        gdb.write_paper(result)        # write one ExtractionResult
-        gdb.write_papers(results)      # write a list
+Fact-centric graph schema
+─────────────────────────
+  (:Paper {id, title})
+    -[:HAS_FACT]->
+  (:ScientificFact {id, fact_type, study_type, task, near_real_time})
+    -[:HAS_STUDY_AREA]->   (:StudyArea {country, region, river_basin})
+    -[:USES_SATELLITE]->   (:Satellite {name, sensor_type})
+    -[:HAS_SENSOR]->       (:Sensor {type, platform})
+    -[:USES_METHOD]->      (:Method {name, category})
+    -[:HAS_METRIC]->       (:Metric {type, value, unit})
+    -[:HAS_EVIDENCE]->     (:Evidence {text, section, field, source})
+  (:Satellite)-[:HAS_SENSOR_TYPE]->(:Sensor)
+  (:Metric)-[:EVALUATES]->(:Method)
+  (:Method)-[:APPLIED_TO]->(:Satellite)
 """
 from __future__ import annotations
 
@@ -21,6 +29,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from src.extraction.base import ExtractionResult
+    from src.extraction.models import FactExtractionResult
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +96,39 @@ class Neo4jWriter:
                 logger.warning("Failed to write %s: %s", r.source_file, exc)
                 err += 1
         logger.info("Graph write: %d OK, %d errors", ok, err)
+
+    # ── Fact-centric graph write ──────────────────────────────────────────────
+
+    def write_fact_paper(self, result: "FactExtractionResult") -> None:
+        """Write a FactExtractionResult to the fact-centric graph schema."""
+        with self._driver.session() as s:
+            s.execute_write(_upsert_fact_paper, result)
+        logger.debug("Fact paper written: %s  (%d facts)", result.paper_id, result.fact_count)
+
+    def write_fact_papers(self, results: list["FactExtractionResult"]) -> None:
+        ok = err = 0
+        for r in results:
+            try:
+                self.write_fact_paper(r)
+                ok += 1
+            except Exception as exc:
+                logger.warning("Failed to write %s: %s", r.paper_id, exc)
+                err += 1
+        logger.info("Fact graph write: %d OK, %d errors", ok, err)
+
+    def create_fact_constraints(self) -> None:
+        """Create uniqueness constraints for the fact-centric schema."""
+        constraints = [
+            "CREATE CONSTRAINT paper_id IF NOT EXISTS FOR (p:Paper) REQUIRE p.id IS UNIQUE",
+            "CREATE CONSTRAINT fact_id IF NOT EXISTS FOR (f:ScientificFact) REQUIRE f.id IS UNIQUE",
+            "CREATE CONSTRAINT satellite_name IF NOT EXISTS FOR (s:Satellite) REQUIRE s.name IS UNIQUE",
+            "CREATE CONSTRAINT method_name IF NOT EXISTS FOR (m:Method) REQUIRE m.name IS UNIQUE",
+            "CREATE CONSTRAINT sensor_type_key IF NOT EXISTS FOR (s:Sensor) REQUIRE s.type IS UNIQUE",
+        ]
+        with self._driver.session() as s:
+            for cypher in constraints:
+                s.run(cypher)
+        logger.info("Fact schema constraints created.")
 
     def create_constraints(self) -> None:
         """Create uniqueness constraints. Run once on a fresh database."""
@@ -327,6 +369,169 @@ def _seed_data_products(tx) -> None:
             MERGE (s:Satellite {name: $sat})
             MERGE (s)-[:PROVIDES_PRODUCT]->(dp)
         """, code=code, sat=sat)
+
+
+# ── Fact-centric transaction functions ────────────────────────────────────────
+
+def _upsert_fact_paper(tx, result: "FactExtractionResult") -> None:
+    """
+    Write one FactExtractionResult (atomic facts) to the fact-centric graph.
+
+    Pass 1 — Paper node + all atomic ScientificFact nodes + entity nodes
+    Pass 2 — RELATED_TO between facts
+    Pass 3 — EVALUATES (Metric→Method) and APPLIED_TO (Method→Satellite)
+    """
+    # ── Paper node (idempotent) ───────────────────────────────────────────────
+    tx.run("""
+        MERGE (p:Paper {id: $id})
+        SET p.title = $title
+    """, id=result.paper_id, title=result.title)
+
+    # ── Pass 1: atomic fact nodes + entity nodes ──────────────────────────────
+    for fact in result.facts:
+        # ScientificFact node
+        tx.run("""
+            MERGE (f:ScientificFact {id: $fid})
+            SET f.fact_type = $fact_type,
+                f.paper_id  = $pid
+            WITH f
+            MATCH (p:Paper {id: $pid})
+            MERGE (p)-[:HAS_FACT]->(f)
+        """, fid=fact.id, pid=result.paper_id, fact_type=fact.fact_type)
+
+        # Type-specific entity node + relationship
+        if fact.fact_type == "data_source" and fact.satellite:
+            _write_data_source(tx, fact)
+
+        elif fact.fact_type == "method" and fact.method:
+            _write_method(tx, fact)
+
+        elif fact.fact_type == "result" and fact.metric:
+            _write_result(tx, fact)
+
+        elif fact.fact_type == "study_area" and fact.study_area:
+            _write_study_area(tx, fact)
+
+        elif fact.fact_type == "task" and fact.task:
+            tx.run("""
+                MATCH (f:ScientificFact {id: $fid})
+                SET f.task = $task
+            """, fid=fact.id, task=fact.task)
+
+        elif fact.fact_type == "system_property" and fact.value:
+            tx.run("""
+                MATCH (f:ScientificFact {id: $fid})
+                SET f.value = $value
+            """, fid=fact.id, value=fact.value)
+
+        # Evidence nodes (one CREATE per evidence — not idempotent by design,
+        # evidence is tied to the specific extraction run via the fact ID)
+        for ev in fact.evidence:
+            tx.run("""
+                CREATE (e:Evidence {
+                    text:     $text,
+                    section:  $section,
+                    field:    $field,
+                    source:   $source,
+                    chunk_id: $chunk_id
+                })
+                WITH e
+                MATCH (f:ScientificFact {id: $fid})
+                MERGE (f)-[:HAS_EVIDENCE]->(e)
+            """, text=ev.text[:200], section=ev.section, field=ev.field,
+                 source=ev.source, chunk_id=ev.chunk_id, fid=fact.id)
+
+    # ── Pass 2: RELATED_TO between atomic facts ───────────────────────────────
+    for fact in result.facts:
+        for related_id in fact.related_fact_ids:
+            tx.run("""
+                MATCH (f1:ScientificFact {id: $fid1})
+                MATCH (f2:ScientificFact {id: $fid2})
+                MERGE (f1)-[:RELATED_TO]->(f2)
+            """, fid1=fact.id, fid2=related_id)
+
+    # ── Pass 3: entity-level cross relationships ──────────────────────────────
+    fact_by_id = {f.id: f for f in result.facts}
+
+    for fact in result.facts:
+        if fact.fact_type == "result" and fact.metric:
+            for related_id in fact.related_fact_ids:
+                related = fact_by_id.get(related_id)
+                if related and related.fact_type == "method" and related.method:
+                    # Metric -[:EVALUATES]-> Method
+                    tx.run("""
+                        MATCH (mt:Metric {type: $mtype})
+                        MATCH (m:Method  {name: $mname})
+                        MERGE (mt)-[:EVALUATES]->(m)
+                    """, mtype=fact.metric.type, mname=related.method.name)
+
+        if fact.fact_type == "method" and fact.method:
+            for related_id in fact.related_fact_ids:
+                related = fact_by_id.get(related_id)
+                if related and related.fact_type == "data_source" and related.satellite:
+                    # Method -[:APPLIED_TO]-> Satellite
+                    tx.run("""
+                        MATCH (m:Method    {name: $mname})
+                        MATCH (s:Satellite {name: $sname})
+                        MERGE (m)-[:APPLIED_TO]->(s)
+                    """, mname=fact.method.name, sname=related.satellite.name)
+
+
+def _write_data_source(tx, fact: "ScientificFact") -> None:
+    sat = fact.satellite
+    tx.run("""
+        MERGE (s:Satellite {name: $name})
+        SET s.sensor_type = COALESCE($stype, s.sensor_type)
+        WITH s
+        MATCH (f:ScientificFact {id: $fid})
+        MERGE (f)-[:USES_SATELLITE]->(s)
+    """, name=sat.name, stype=sat.sensor_type, fid=fact.id)
+
+    if sat.sensor_type:
+        tx.run("""
+            MERGE (sn:Sensor {type: $stype})
+            WITH sn
+            MATCH (s:Satellite {name: $sname})
+            MERGE (s)-[:HAS_SENSOR_TYPE]->(sn)
+        """, stype=sat.sensor_type, sname=sat.name)
+
+
+def _write_method(tx, fact: "ScientificFact") -> None:
+    m = fact.method
+    tx.run("""
+        MERGE (m:Method {name: $name})
+        SET m.category = COALESCE($cat, m.category)
+        WITH m
+        MATCH (f:ScientificFact {id: $fid})
+        MERGE (f)-[:USES_METHOD]->(m)
+    """, name=m.name, cat=m.category, fid=fact.id)
+
+
+def _write_result(tx, fact: "ScientificFact") -> None:
+    mt = fact.metric
+    tx.run("""
+        MERGE (mt:Metric {type: $mtype})
+        WITH mt
+        MATCH (f:ScientificFact {id: $fid})
+        MERGE (f)-[r:HAS_METRIC]->(mt)
+        SET r.value = $value,
+            r.unit  = $unit
+    """, mtype=mt.type, value=mt.value, unit=mt.unit, fid=fact.id)
+
+
+def _write_study_area(tx, fact: "ScientificFact") -> None:
+    sa = fact.study_area
+    tx.run("""
+        MERGE (a:StudyArea {country: $country})
+        SET a.region      = COALESCE($region,      a.region),
+            a.river_basin = COALESCE($river_basin, a.river_basin)
+        WITH a
+        MATCH (f:ScientificFact {id: $fid})
+        MERGE (f)-[:HAS_STUDY_AREA]->(a)
+    """, country=sa.country or "Unknown",
+         region=sa.region,
+         river_basin=sa.river_basin,
+         fid=fact.id)
 
 
 # ── Utility ───────────────────────────────────────────────────────────────────

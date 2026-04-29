@@ -618,3 +618,41 @@ def describe_parsed(sections: SectionDict) -> tuple[list[str], list[str]]:
     found   = [k for k in content_keys if sections.get(k)]
     missing = [k for k in content_keys if not sections.get(k)]
     return found, missing
+
+
+# ── Canonical schema dataclass ────────────────────────────────────────────────
+
+from dataclasses import dataclass as _dc  # noqa: E402
+
+
+@_dc
+class DocumentSections:
+    """
+    Typed container for parsed document sections.
+
+    This is the ONE canonical schema all downstream code must consume.
+    All fields default to None when a section was not detected.
+    """
+    title:        str | None = None
+    abstract:     str | None = None
+    introduction: str | None = None
+    methods:      str | None = None
+    results:      str | None = None
+    discussion:   str | None = None
+
+    @classmethod
+    def from_dict(cls, d: SectionDict) -> "DocumentSections":
+        return cls(**{k: d.get(k) for k in SECTION_KEYS})
+
+    def to_dict(self) -> SectionDict:
+        return {k: getattr(self, k) for k in SECTION_KEYS}
+
+
+# ── Debug helper ──────────────────────────────────────────────────────────────
+
+def debug_sections(sections: SectionDict, source_name: str = "") -> None:
+    """Print detected / missing sections to stdout (always; used for diagnostics)."""
+    found, missing = describe_parsed(sections)
+    prefix = f"[{source_name}] " if source_name else ""
+    print(f"\n{prefix}Sections detected: {found or '—'}")
+    print(f"{prefix}Missing sections:  {missing or '—'}")

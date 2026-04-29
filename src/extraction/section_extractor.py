@@ -2,7 +2,7 @@
 Section-aware LLM extractor for satellite flood mapping literature.
 
 Architecture:
-    PDF chunks (page-ordered) → split_sections → 3 targeted LLM calls → merge
+    PDF chunks (page-ordered) → parse_document_sections → 3 targeted LLM calls → merge
 
 Three LLM calls per paper:
     1. Abstract   → study_type, satellite_names, sensor_type, data_product,
@@ -11,7 +11,12 @@ Three LLM calls per paper:
     2. Methods    → methods, satellite_names, sensor_type, data_product (override)
     3. Results    → OA, F1, IoU, Kappa (validated: number must appear in text)
 
-Merge priority: Results > Methods > Abstract > regex fallback
+Merge policy (Task 4):
+    - Section-based LLM values are NEVER overridden by regex fallback.
+    - Regex fills ONLY empty fields (bibliographic + geography).
+    - Metrics and methods are NEVER filled from full-text regex.
+
+Uses src.extraction.section_parser (canonical, not the deprecated processing one).
 """
 from __future__ import annotations
 
@@ -26,7 +31,7 @@ import requests
 from src.config import OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT
 from src.extraction.base import BaseExtractor, ExtractionResult
 from src.extraction.regex_extractor import RegexExtractor
-from src.processing.section_parser import describe_sections, split_sections
+from src.extraction.section_parser import parse_document_sections, describe_parsed
 
 logger = logging.getLogger(__name__)
 
@@ -52,11 +57,11 @@ _ABSTRACT_PROMPT = textwrap.dedent("""\
     - Study_Type: one of "Satellite flood mapping" | "ML/DL classification" |
       "Hydrological forecasting" | "Hydraulic modeling" |
       "Operational mapping system" | "Review paper" | "Dataset/benchmark paper"
-    - Satellite_Names: comma-separated list (e.g. "Sentinel-1, Sentinel-2"); null if absent
+    - Satellite_Names: comma-separated list; null if absent
     - Sensor_Type: "SAR" | "Optical" | "Multi-sensor"; null if absent
     - Data_Product: e.g. "GRD", "MSI", "OLI"; null if not mentioned
-    - Country: country name (prefer country over region); null if absent
-    - Region: sub-national region, continent, or general area; null if absent
+    - Country: country name; null if absent
+    - Region: sub-national region or continent; null if absent
     - River_Basin: river or basin name; null if absent
     - City_Event: city name or specific flood event; null if absent
     - Methods: comma-separated list from:
@@ -76,11 +81,11 @@ _METHODS_PROMPT = textwrap.dedent("""\
       Methods, Satellite_Names, Sensor_Type, Data_Product
 
     Rules:
-    - Methods: comma-separated list of all processing approaches found:
+    - Methods: comma-separated list of all processing approaches:
         Thresholding | Change detection | NDWI/MNDWI | Random Forest | SVM |
         Maximum likelihood | U-Net | CNN | LSTM | Transformer | OBIA |
         Hydrodynamic model | Operational workflow
-    - Satellite_Names: comma-separated list of satellite/sensor names; null if absent
+    - Satellite_Names: comma-separated list; null if absent
     - Sensor_Type: "SAR" | "Optical" | "Multi-sensor"; null if absent
     - Data_Product: e.g. "GRD", "MSI", "OLI"; null if absent
 
@@ -128,12 +133,34 @@ def _validate_metrics(result: ExtractionResult, text: str) -> ExtractionResult:
     return result
 
 
+# ── Quality scoring (mirrors scientific_extractor, kept local to avoid circular import) ──
+
+def _quality_score(sections: dict, satellite_csv: str) -> float:
+    score  = 1 if sections.get("title")    else 0
+    score += 1 if sections.get("abstract") else 0
+    score += 1 if sections.get("methods")  else 0
+    score += 1 if sections.get("results")  else 0
+    score += 1 if satellite_csv.strip()    else 0
+    return score / 5.0
+
+
+def _compute_confidence(quality: float, n_sections_used: int) -> float:
+    sec_norm = min(n_sections_used / 3.0, 1.0)
+    return round(min(0.6 * quality + 0.4 * sec_norm, 1.0), 3)
+
+
 # ── SectionExtractor ──────────────────────────────────────────────────────────
 
 class SectionExtractor(BaseExtractor):
     """
     Section-aware extractor for flood mapping papers.
     Falls back to RegexExtractor when Ollama is unreachable.
+
+    Merge policy:
+    - LLM section calls win for their respective fields.
+    - Regex fallback fills ONLY bibliographic + geography gaps.
+    - Metrics (OA/F1/IoU/Kappa) are NEVER filled from regex full-text scan.
+    - Methods are NEVER filled from regex full-text scan.
     """
 
     def __init__(
@@ -153,30 +180,33 @@ class SectionExtractor(BaseExtractor):
         self._results_max  = results_max
         self._available: bool | None = None
 
-    # ── BaseExtractor interface ───────────────────────────────────────────────
-
     def extract(
         self,
         chunks: list[dict],
         source_file: str,
     ) -> ExtractionResult:
-        ordered  = sorted(chunks, key=lambda c: (c.get("page_start", 0), c.get("chunk_id", "")))
+        ordered   = sorted(chunks, key=lambda c: (c.get("page_start", 0), c.get("chunk_id", "")))
         full_text = "\n\n".join(c["text"] for c in ordered)
 
-        regex_result = _FALLBACK.extract(chunks, source_file)
+        # Use canonical section parser (Task 1)
+        sections = parse_document_sections(full_text)
+        found, missing = describe_parsed(sections)
+        _debug_sections(source_file, found, missing)
 
-        sections = split_sections(full_text)
-        found, missing = describe_sections(sections)
-        self._debug_sections(source_file, found, missing)
+        # Always prepare the regex baseline for bibliographic fields
+        regex_result = _FALLBACK.extract(chunks, source_file)
 
         if not self._is_available():
             logger.warning("Ollama unavailable — regex fallback for %s", source_file)
+            regex_result.llm_used      = False
+            regex_result.fallback_used = True
+            regex_result.extractor_mode = "fallback"
             return regex_result
 
         result = ExtractionResult(source_file=source_file)
         sections_used: list[str] = []
 
-        # Call 1: Abstract → full thematic profile
+        # ── Call 1: Abstract → full thematic profile ─────────────────────────
         abstract_text = sections.get("abstract") or regex_result.abstract or ""
         if abstract_text:
             abs_r = self._call_section(
@@ -188,9 +218,18 @@ class SectionExtractor(BaseExtractor):
                 "methods", "near_real_time", "latency",
             ))
             sections_used.append("abstract")
+            # Record provenance for LLM-sourced fields
+            for field_name in ("satellite_names", "country", "river_basin", "methods"):
+                if getattr(result, field_name, None):
+                    result.provenance[field_name.title().replace("_", "")] = {
+                        "section":        "abstract",
+                        "snippet":        abstract_text[:120],
+                        "source":         "llm",
+                        "extractor_mode": "section",
+                    }
 
-        # Call 2: Methods → precise methods + sensor (override)
-        methods_text = sections.get("methods") or sections.get("data") or ""
+        # ── Call 2: Methods → precise methods + sensor (override abstract) ────
+        methods_text = sections.get("methods") or ""
         if methods_text:
             meth_r = self._call_section(
                 _METHODS_PROMPT, methods_text[:self._methods_max], source_file
@@ -199,11 +238,19 @@ class SectionExtractor(BaseExtractor):
                    ("methods", "satellite_names", "sensor_type", "data_product"),
                    override=True)
             sections_used.append("methods")
+            if result.methods:
+                result.provenance["Methods"] = {
+                    "section":        "methods",
+                    "snippet":        methods_text[:120],
+                    "source":         "llm",
+                    "extractor_mode": "section",
+                }
 
-        # Call 3: Results → metrics (only for classification/mapping papers)
+        # ── Call 3: Results → metrics ONLY ───────────────────────────────────
         results_text = sections.get("results") or ""
         if results_text and result.study_type in (
-            "ML/DL classification", "Satellite flood mapping", ""
+            "ML/DL classification", "Satellite flood mapping",
+            "Operational mapping system", "",
         ):
             res_r = self._call_section(
                 _RESULTS_PROMPT, results_text[:self._results_max], source_file
@@ -211,16 +258,25 @@ class SectionExtractor(BaseExtractor):
             res_r = _validate_metrics(res_r, results_text)
             _merge(result, res_r, ("oa", "f1", "iou", "kappa"))
             sections_used.append("results")
+            # Provenance for metrics
+            for fname, attr in [("OA","oa"),("F1","f1"),("IoU","iou"),("Kappa","kappa")]:
+                if getattr(result, attr) is not None:
+                    result.provenance[fname] = {
+                        "section":        "results",
+                        "snippet":        results_text[:120],
+                        "source":         "llm",
+                        "extractor_mode": "section",
+                    }
 
-        # Regex fills remaining gaps
+        # ── Regex fills ONLY bibliographic + geography gaps ───────────────────
+        # NEVER fills metrics or methods — those must come from section calls.
         _merge(result, regex_result, (
-            "oa", "f1", "iou", "kappa",
             "study_type", "satellite_names", "sensor_type", "data_product",
-            "country", "river_basin", "city_event", "methods",
+            "country", "river_basin", "city_event",
             "near_real_time", "latency", "revisit_time",
         ))
 
-        # Bibliographic fields always from regex
+        # Bibliographic fields always from regex (reliable, section-independent)
         result.title     = regex_result.title
         result.abstract  = regex_result.abstract
         result.doi       = regex_result.doi
@@ -229,12 +285,17 @@ class SectionExtractor(BaseExtractor):
         result.full_text = regex_result.full_text
         result.evidence  = regex_result.evidence
 
-        # Geography fields from keyword scan — always use regex (reliable)
         result.ukraine_relevance = regex_result.ukraine_relevance
         result.river_name        = regex_result.river_name or result.river_basin
 
-        result.sections_used = sections_used
-        result.confidence    = 0.90
+        result.sections_used  = sections_used
+        result.llm_used       = True
+        result.fallback_used  = len(sections_used) < 2
+        result.extractor_mode = "section" if sections_used else "mixed"
+
+        quality = _quality_score(sections, result.satellite_names)
+        result.quality_score = quality
+        result.confidence    = _compute_confidence(quality, len(sections_used))
 
         return result.finalize()
 
@@ -334,21 +395,21 @@ class SectionExtractor(BaseExtractor):
             kappa           = _f("Kappa"),
         )
 
-    # ── Debug ─────────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _debug_sections(
-        source_file: str,
-        found: list[str],
-        missing: list[str],
-    ) -> None:
-        logger.info("[%s]  found=%s  missing=%s", source_file, found, missing)
-        print(f"\n  [{source_file}]")
-        print(f"    Sections found:   {found or '—'}")
-        print(f"    Missing sections: {missing or '—'}")
+# ── Debug ─────────────────────────────────────────────────────────────────────
+
+def _debug_sections(
+    source_file: str,
+    found: list[str],
+    missing: list[str],
+) -> None:
+    logger.info("[%s]  found=%s  missing=%s", source_file, found, missing)
+    print(f"\n  [{source_file}]")
+    print(f"    Sections found:   {found or '—'}")
+    print(f"    Missing sections: {missing or '—'}")
 
 
-# ── Merge helper ──────────────────────────────────────────────────────────────
+# ── Merge helper (Task 4) ─────────────────────────────────────────────────────
 
 def _merge(
     target: ExtractionResult,
@@ -356,6 +417,14 @@ def _merge(
     fields: tuple[str, ...],
     override: bool = False,
 ) -> None:
+    """
+    Copy fields from source → target.
+
+    With override=False (default): only fills EMPTY target fields.
+    With override=True: overwrites target even if non-empty.
+    NEVER called with override=True for regex fallback — only for
+    the Methods LLM call which is more authoritative than Abstract.
+    """
     for f in fields:
         src_val = getattr(source, f, None)
         if src_val is None or src_val == "" or src_val is False:

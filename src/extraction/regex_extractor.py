@@ -1,8 +1,15 @@
 """
 Rule-based extractor for satellite-based flood mapping literature.
 
-Extracts: bibliographic metadata, study type, satellite/sensor information,
-study area, processing methods, optional accuracy metrics, and timeliness.
+Section-gated extraction (Task 2 / Task 5):
+  - Methods   → methods section ONLY
+  - Metrics   → results section ONLY
+  - Satellites → abstract + introduction + methods (never results)
+  - Country   → abstract + introduction
+  - Study type → abstract (or first 3000 chars as fallback)
+
+Extracts: bibliographic metadata, study type, satellite/sensor,
+study area, processing methods, optional accuracy metrics, timeliness.
 Works entirely offline — no LLM required.
 """
 from __future__ import annotations
@@ -24,7 +31,7 @@ def _r(pattern: str) -> re.Pattern:
 
 _NUM   = r"([\d]+\.?[\d]*)"
 _PCT   = r"%?"
-_SEP   = r"\s*[=:>]?\s*"
+_SEP   = r"\s*(?:[=:>]|of|was|is|at|:|=)?\s*"
 _RANGE = rf"{_NUM}\s*[-–]\s*{_NUM}"
 
 
@@ -65,6 +72,28 @@ KAPPA_PATTERNS: list[re.Pattern] = [
     _r(rf"[Kk]appa\s+[Cc]oefficient{_SEP}{_NUM}"),
     _r(rf"[Cc]ohen.?s\s+[Kk]appa{_SEP}{_NUM}"),
     _r(rf"\b[Kk]appa\b{_SEP}{_NUM}"),
+]
+
+# ── Non-normalised metrics (RMSE / MAE can be > 1) ────────────────────────────
+# Capture groups: (value, unit?)
+_UNIT = r"\s*(m(?:eters?)?|cm|mm|m\^?3\s*/\s*s|m3/s)?"
+
+RMSE_PATTERNS: list[re.Pattern] = [
+    _r(rf"\bRMSE{_SEP}({_NUM[1:-1]}){_UNIT}"),
+    _r(rf"[Rr]oot[\s\-][Mm]ean[\s\-][Ss]quare(?:[d]?\s+[Ee]rror)?{_SEP}({_NUM[1:-1]}){_UNIT}"),
+]
+
+MAE_PATTERNS: list[re.Pattern] = [
+    _r(rf"\bMAE{_SEP}({_NUM[1:-1]}){_UNIT}"),
+    _r(rf"[Mm]ean\s+[Aa]bsolute\s+[Ee]rror{_SEP}({_NUM[1:-1]}){_UNIT}"),
+]
+
+# R² is always 0–1; reuse standard normalised extractor
+R2_PATTERNS: list[re.Pattern] = [
+    _r(rf"[Rr][\^2²]\s*{_SEP}{_NUM}"),
+    _r(rf"\bR2\b{_SEP}{_NUM}"),
+    _r(rf"[Cc]oefficient\s+of\s+[Dd]etermination{_SEP}{_NUM}"),
+    _r(rf"\bNSE\b{_SEP}{_NUM}"),   # Nash–Sutcliffe Efficiency (same 0–1 scale)
 ]
 
 
@@ -115,30 +144,44 @@ _DATA_PRODUCTS = [
     "iw grd", "iw mode", "sm mode",
 ]
 
-# ── Methods keyword map: (canonical_name, [trigger_keywords]) ─────────────────
+# ── Methods keyword map ───────────────────────────────────────────────────────
 
 _METHODS_RULES: list[tuple[str, list[str]]] = [
-    ("Thresholding",        ["threshold", "thresholding", "otsu", "bimodal threshold",
-                             "empirical threshold", "histogram threshold", "constant threshold"]),
-    ("Change detection",    ["change detection", "multi-temporal", "bitemporal",
-                             "bi-temporal", "pre-flood and post-flood", "pre/post-flood"]),
-    ("NDWI/MNDWI",          ["ndwi", "mndwi", "normalized difference water index",
-                             "modified ndwi", "awei", "automated water extraction"]),
-    ("Random Forest",       ["random forest", "rf classifier"]),
-    ("SVM",                 ["support vector machine", r"\bsvm\b"]),
-    ("Maximum likelihood",  ["maximum likelihood", r"\bmlc\b"]),
-    ("U-Net",               ["u-net", "unet", "attention u-net", "attention unet",
-                             "fsa-unet", "res-unet"]),
-    ("CNN",                 ["convolutional neural network", r"\bcnn\b", "fcnn",
-                             "fully convolutional", "segnet", "deeplab", "basnet"]),
-    ("LSTM",                [r"\blstm\b", "long short-term memory"]),
-    ("Transformer",         ["vision transformer", r"\bvit\b", "swin transformer"]),
-    ("OBIA",                ["obia", "object-based image analysis", "object-oriented"]),
-    ("Hydrodynamic model",  ["hydrodynamic model", "hydraulic model", "hec-ras",
-                             "lisflood", "flo-2d", "mike flood", "mike 21",
-                             "2d flood simulation", "inundation model"]),
-    ("Operational workflow", ["copernicus ems", "emergency mapping", "rapid mapping",
-                              "operational workflow", "automated pipeline"]),
+    ("Thresholding",            ["threshold", "thresholding", "otsu", "bimodal threshold",
+                                 "empirical threshold", "histogram threshold",
+                                 "constant threshold"]),
+    ("Change detection",        ["change detection", "multi-temporal", "bitemporal",
+                                 "bi-temporal", "pre-flood and post-flood", "pre/post-flood"]),
+    ("NDWI/MNDWI",              ["ndwi", "mndwi", "normalized difference water index",
+                                 "modified ndwi", "awei", "automated water extraction"]),
+    ("Random Forest",           ["random forest", "rf classifier"]),
+    ("SVM",                     ["support vector machine", r"\bsvm\b"]),
+    ("Maximum likelihood",      ["maximum likelihood", r"\bmlc\b"]),
+    ("U-Net",                   ["u-net", "unet", "attention u-net", "attention unet",
+                                 "fsa-unet", "res-unet"]),
+    ("CNN",                     ["convolutional neural network", r"\bcnn\b", "fcnn",
+                                 "fully convolutional", "segnet", "deeplab", "basnet"]),
+    ("LSTM",                    [r"\blstm\b", "long short-term memory"]),
+    ("Transformer",             ["vision transformer", r"\bvit\b", "swin transformer"]),
+    ("OBIA",                    ["obia", "object-based image analysis", "object-oriented"]),
+    # Hydraulic / hydrological models — keep specific names separate so the graph
+    # can distinguish HEC-RAS (hydraulic) from SWAT/HEC-HMS (hydrological)
+    ("HEC-RAS",                 [r"\bhec[\s\-]ras\b", "hec ras"]),
+    ("HEC-HMS",                 [r"\bhec[\s\-]hms\b", "hec hms"]),
+    ("SWAT",                    [r"\bswat\b(?!\s+team)", "soil and water assessment tool"]),
+    ("Hydrodynamic model",      ["hydrodynamic model", "hydraulic model",
+                                 "lisflood", "flo-2d", "mike flood", "mike 21",
+                                 "2d flood simulation", "inundation model"]),
+    # Validation & analysis methods
+    ("DEM validation",          ["dem validation", "dem accuracy", "elevation accuracy",
+                                 "digital elevation model validation",
+                                 "vertical accuracy assessment"]),
+    ("ICESat-2 validation",     ["icesat-2 validation", "icesat-2 data", "atlas/icesat-2",
+                                 "atl03", "atl06", "atl08", "icesat2"]),
+    ("Flood frequency analysis",["flood frequency", "return period", "recurrence interval",
+                                 "frequency analysis", "extreme value analysis"]),
+    ("Operational workflow",    ["copernicus ems", "emergency mapping", "rapid mapping",
+                                 "operational workflow", "automated pipeline"]),
 ]
 
 
@@ -153,23 +196,20 @@ _KNOWN_COUNTRIES = [
     "vietnam", "global",
 ]
 
-# ── Ukraine-specific geographic keywords ─────────────────────────────────────
-# Any of these triggers ukraine_relevance = True
-
 _UKRAINE_KW = {
     "ukraine", "ukrainian",
     "dnipro", "dnieper",
-    "kakhovka",                # Kakhovka reservoir / dam
-    "prut",                    # Prut River (western Ukraine / Moldova)
-    "dniester", "dnister",     # Dniester River
-    "tisza", "tysa",           # Tisza / Tysa River (Zakarpattia)
+    "kakhovka",
+    "prut",
+    "dniester", "dnister",
+    "tisza", "tysa",
     "carpathian", "carpathians",
     "bukovyna", "bukovina",
     "zakarpattia", "transcarpathia",
     "kherson", "kyiv", "odesa", "mykolaiv",
     "zaporizhzhia", "poltava", "vinnytsia",
     "chernihiv", "sumy", "zhytomyr",
-    "desna",                   # Desna River
+    "desna",
     "pivdennyi buh", "southern bug",
 }
 
@@ -180,28 +220,21 @@ _RIVER_BASINS = [
     "loire", "thames", "indus basin", "yangtze", "yellow river",
     "niger basin", "zambezi", "murray-darling", "colorado river",
     "columbia river", "volga", "dnipro basin", "dnieper basin",
-    "dniester basin", "prut basin", "tisza basin",
+    "dniester basin", "prut basin", "prut river basin", "tisza basin",
+    "tisza river basin", "dnipro river basin", "dniester river basin",
     "carpathian basin", "irrawaddy", "red river",
 ]
 
-# ── Individual river names (finer than basin) ────────────────────────────────
-
 _RIVER_NAMES = [
-    # Ukrainian / Eastern European rivers
     "dnipro", "dnieper", "dniester", "dnister", "prut", "tisza", "tysa",
     "desna", "southern bug", "pivdennyi buh", "siversky donets",
-    # Other European rivers
     "danube", "rhine", "elbe", "oder", "vistula", "thames", "seine",
     "po", "tiber", "rhone", "loire", "meuse", "main", "mosel",
     "drava", "sava", "tisa", "morava",
-    # Asian rivers
     "ganges", "brahmaputra", "mekong", "yangtze", "yellow river",
-    "irrawaddy", "indus", "godavari", "mahanadi", "brahmaputra",
-    # Americas
+    "irrawaddy", "indus", "godavari", "mahanadi",
     "mississippi", "missouri", "amazon", "colorado", "columbia",
-    # Africa
     "nile", "niger", "zambezi", "congo",
-    # Other
     "volga", "ob", "lena", "yenisei",
 ]
 
@@ -264,11 +297,9 @@ def _extract_doi(text: str) -> str:
 
 
 def _extract_year(text: str, source_file: str) -> str:
-    # prefer year from first 1000 chars (title/author area)
     m = _YEAR_RE.search(text[:1000])
     if m:
         return m.group(1)
-    # fall back to filename
     m = _YEAR_RE.search(source_file)
     return m.group(1) if m else ""
 
@@ -284,7 +315,7 @@ def _extract_authors(text: str, source_file: str) -> str:
     return " ".join(parts[:3]) if parts else "Unknown"
 
 
-# ── Study type classification ─────────────────────────────────────────────────
+# ── Study type ────────────────────────────────────────────────────────────────
 
 def _classify_study_type(text: str) -> str:
     tl = text.lower()
@@ -309,28 +340,13 @@ def _classify_study_type(text: str) -> str:
     return "Satellite flood mapping"
 
 
-# ── Satellite / sensor detection ──────────────────────────────────────────────
+# ── Satellite / sensor ────────────────────────────────────────────────────────
 
 def _detect_satellites(text: str) -> tuple[str, str]:
-    """Return (satellite_names_csv, sensor_type)."""
+    """Return (satellite_names_csv, sensor_type) from section-gated text."""
     tl = text.lower()
-
-    sar_found = [s for s in _SAR_SATELLITES if s in tl]
-    opt_found = [s for s in _OPT_SATELLITES if s in tl]
-
-    # deduplicate preserving order
-    def _dedup(lst: list[str]) -> list[str]:
-        seen: set[str] = set()
-        out = []
-        for x in lst:
-            if x not in seen:
-                seen.add(x)
-                out.append(x)
-        return out
-
-    sar_found = _dedup(sar_found)
-    opt_found = _dedup(opt_found)
-
+    sar_found = _dedup([s for s in _SAR_SATELLITES if s in tl])
+    opt_found = _dedup([s for s in _OPT_SATELLITES if s in tl])
     all_found = [s.title() for s in sar_found + opt_found]
     names_csv = ", ".join(all_found[:6]) if all_found else ""
 
@@ -348,16 +364,14 @@ def _detect_satellites(text: str) -> tuple[str, str]:
 
 def _detect_data_product(text: str) -> str:
     tl = text.lower()
-    found = [p for p in _DATA_PRODUCTS if p.lower() in tl]
-    # deduplicate
-    seen: set[str] = set()
-    unique = [p.upper() for p in found if p not in seen and not seen.add(p)]  # type: ignore
-    return ", ".join(unique[:4]) if unique else ""
+    found = _dedup([p for p in _DATA_PRODUCTS if p.lower() in tl])
+    return ", ".join(p.upper() for p in found[:4]) if found else ""
 
 
-# ── Methods detection ─────────────────────────────────────────────────────────
+# ── Methods ───────────────────────────────────────────────────────────────────
 
 def _detect_methods(text: str) -> str:
+    """Extract methods from *text* (caller must pass methods section text only)."""
     tl = text.lower()
     found = []
     for canonical, triggers in _METHODS_RULES:
@@ -365,33 +379,27 @@ def _detect_methods(text: str) -> str:
             if re.search(kw, tl):
                 found.append(canonical)
                 break
-    # deduplicate preserving order
-    seen: set[str] = set()
-    unique = [m for m in found if m not in seen and not seen.add(m)]  # type: ignore
-    return ", ".join(unique) if unique else ""
+    return ", ".join(_dedup(found)) if found else ""
 
 
-# ── Study area detection ──────────────────────────────────────────────────────
+# ── Geography ─────────────────────────────────────────────────────────────────
 
 def _detect_country(text: str) -> str:
+    """Detect country from abstract + introduction text (caller-scoped)."""
     tl = text.lower()
+    if any(kw in tl for kw in _UKRAINE_KW):
+        return "Ukraine"
     found = [c.title() for c in _KNOWN_COUNTRIES if c in tl]
-    # prefer a contextual match
     m = _REGION_CONTEXT_PAT.search(text)
     if m:
-        phrase = m.group(0).strip()[:80]
-        return phrase
-    seen: set[str] = set()
-    unique = [c for c in found if c not in seen and not seen.add(c)]  # type: ignore
-    return ", ".join(unique[:4]) if unique else ""
+        return m.group(0).strip()[:80]
+    return ", ".join(_dedup(found)[:4]) if found else ""
 
 
 def _detect_river_basin(text: str) -> str:
     tl = text.lower()
     found = [b.title() for b in _RIVER_BASINS if b in tl]
-    seen: set[str] = set()
-    unique = [b for b in found if b not in seen and not seen.add(b)]  # type: ignore
-    return ", ".join(unique[:3]) if unique else ""
+    return ", ".join(_dedup(found)[:3]) if found else ""
 
 
 _CITY_EVENT_PAT = _r(
@@ -405,18 +413,11 @@ def _detect_city_event(text: str) -> str:
     return m.group(1).strip()[:60] if m else ""
 
 
-# ── Ukraine relevance ─────────────────────────────────────────────────────────
-
 def _detect_ukraine_relevance(text: str) -> bool:
-    """True if any Ukraine-specific geographic keyword appears in *text*."""
     tl = text.lower()
     return any(kw in tl for kw in _UKRAINE_KW)
 
 
-# ── River name detection ──────────────────────────────────────────────────────
-
-# Pre-compiled patterns: short names (≤3 chars) need \b word boundaries to avoid
-# matching inside other words ("ob" inside "global", "po" inside "poland", etc.)
 _RIVER_PATTERNS: list[tuple[str, re.Pattern]] = [
     (name, re.compile(
         r"\b" + re.escape(name) + r"\b" if len(name) <= 3
@@ -428,20 +429,16 @@ _RIVER_PATTERNS: list[tuple[str, re.Pattern]] = [
 
 
 def _detect_river_name(text: str) -> str:
-    """Extract specific river names with word-boundary protection for short names."""
     found = []
     for canonical, pat in _RIVER_PATTERNS:
         if pat.search(text):
             found.append(canonical.title())
-    seen: set[str] = set()
-    unique = [r for r in found if r not in seen and not seen.add(r)]  # type: ignore
-    return ", ".join(unique[:5]) if unique else ""
+    return ", ".join(_dedup(found)[:5]) if found else ""
 
 
-# ── Timeliness detection ──────────────────────────────────────────────────────
+# ── Timeliness ────────────────────────────────────────────────────────────────
 
 def _detect_timeliness(text: str) -> tuple[str, str, bool | None]:
-    """Return (latency, revisit_time, near_real_time)."""
     nrt: bool | None = None
     if _NRT_PAT.search(text):
         nrt = True
@@ -459,19 +456,31 @@ def _detect_timeliness(text: str) -> tuple[str, str, bool | None]:
     return latency, revisit, nrt
 
 
-# ── Confidence scoring ────────────────────────────────────────────────────────
+# ── Confidence scoring (Task 6) ───────────────────────────────────────────────
 
 def _score_confidence(r: ExtractionResult) -> float:
-    score = 0.0
-    score += 0.20 if r.title     else 0.0
-    score += 0.15 if r.satellite_names else 0.0
-    score += 0.15 if r.country        else 0.0
-    score += 0.15 if r.methods        else 0.0
-    score += 0.10 if r.study_type     else 0.0
-    score += 0.10 if r._num_metrics() > 0 else 0.0
-    score += 0.10 if r.authors        else 0.0
-    score += 0.05 if r.river_basin    else 0.0
-    return min(round(score, 2), 1.0)
+    """
+    Weighted confidence: 60% quality (structural) + 40% field evidence.
+    Replaces the old completeness-only formula.
+    """
+    quality = 0
+    quality += 1 if r.title          else 0
+    quality += 1 if r.abstract       else 0
+    quality += 1 if r.methods        else 0
+    quality += 1 if any(v is not None for v in [r.oa, r.f1, r.iou, r.kappa]) else 0
+    quality += 1 if r.satellite_names else 0
+    q_norm = quality / 5.0
+
+    evidence = 0
+    evidence += 1 if r.satellite_names else 0
+    evidence += 1 if r.country         else 0
+    evidence += 1 if r.methods         else 0
+    evidence += 1 if r.study_type      else 0
+    evidence += 1 if r._num_metrics() > 0 else 0
+    evidence += 1 if r.river_basin     else 0
+    e_norm = evidence / 6.0
+
+    return round(min(0.6 * q_norm + 0.4 * e_norm, 1.0), 3)
 
 
 # ── Evidence collection ───────────────────────────────────────────────────────
@@ -495,6 +504,7 @@ def _parse_number(raw: str) -> float:
 
 
 def _extract_metric(text: str, patterns: list[re.Pattern]) -> float | None:
+    """Extract metric from *text*. Caller must scope to results section."""
     for pat in patterns:
         for m in pat.finditer(text):
             groups = [g for g in m.groups() if g is not None]
@@ -515,11 +525,24 @@ def _extract_metric(text: str, patterns: list[re.Pattern]) -> float | None:
     return None
 
 
+# ── Dedup helper ──────────────────────────────────────────────────────────────
+
+def _dedup(lst: list[str]) -> list[str]:
+    seen: set[str] = set()
+    return [x for x in lst if x not in seen and not seen.add(x)]  # type: ignore
+
+
 # ── Main extractor class ──────────────────────────────────────────────────────
 
 class RegexExtractor(BaseExtractor):
     """
-    Offline rule-based extractor for satellite flood mapping literature.
+    Section-aware offline rule-based extractor.
+
+    All fields are gated to the appropriate section:
+    - Methods: methods section only
+    - Metrics: results section only
+    - Satellites/Country: abstract + introduction
+    When sections cannot be parsed, those fields are left empty.
     """
 
     def extract(
@@ -527,45 +550,89 @@ class RegexExtractor(BaseExtractor):
         chunks: list[dict],
         source_file: str,
     ) -> ExtractionResult:
+        from src.extraction.section_parser import parse_document_sections, describe_parsed
+
         combined = "\n\n".join(c["text"] for c in chunks)
         result   = ExtractionResult(source_file=source_file)
 
-        # Bibliographic
-        result.title    = _extract_title(combined, source_file)
-        result.abstract = _extract_abstract(combined)
-        result.doi      = _extract_doi(combined)
-        result.year     = _extract_year(combined, source_file)
-        result.authors  = _extract_authors(combined, source_file)
+        # Parse sections for gated extraction (Task 2)
+        sections     = parse_document_sections(combined)
+        found, missing = describe_parsed(sections)
+        logger.info("[%s]  sections found=%s  missing=%s", source_file, found, missing)
+
+        abstract_text     = sections.get("abstract")     or ""
+        introduction_text = sections.get("introduction") or ""
+        methods_text      = sections.get("methods")      or ""
+        results_text      = sections.get("results")      or ""
+        has_sections      = bool(methods_text or results_text)
+
+        # ── Bibliographic (always from full text — section-independent) ───────
+        result.title     = _extract_title(combined, source_file)
+        result.abstract  = abstract_text or _extract_abstract(combined)
+        result.doi       = _extract_doi(combined)
+        result.year      = _extract_year(combined, source_file)
+        result.authors   = _extract_authors(combined, source_file)
         result.full_text = combined
 
-        # Study type
-        result.study_type = _classify_study_type(combined)
+        # ── Study type — from abstract (fallback: first 3000 chars) ──────────
+        type_text         = abstract_text or combined[:3000]
+        result.study_type = _classify_study_type(type_text)
 
-        # Satellite / sensor
-        result.satellite_names, result.sensor_type = _detect_satellites(combined)
-        result.data_product = _detect_data_product(combined)
+        # ── Satellites — abstract + introduction + methods (never results) ────
+        sat_text = f"{abstract_text} {introduction_text} {methods_text}"
+        if not sat_text.strip():
+            sat_text = combined[:6000]
+        result.satellite_names, result.sensor_type = _detect_satellites(sat_text)
+        result.data_product = _detect_data_product(sat_text)
 
-        # Study area
-        result.country            = _detect_country(combined)
-        result.river_basin        = _detect_river_basin(combined)
-        result.river_name         = _detect_river_name(combined)
-        result.city_event         = _detect_city_event(combined)
-        result.ukraine_relevance  = _detect_ukraine_relevance(combined)
+        # ── Geography — abstract + introduction ───────────────────────────────
+        geo_text = f"{abstract_text} {introduction_text}"
+        if not geo_text.strip():
+            geo_text = combined[:5000]
+        result.country           = _detect_country(geo_text)
+        result.river_basin       = _detect_river_basin(geo_text)
+        result.river_name        = _detect_river_name(geo_text)
+        result.city_event        = _detect_city_event(geo_text[:3000])
+        result.ukraine_relevance = _detect_ukraine_relevance(geo_text)
 
-        # Methods
-        result.methods = _detect_methods(combined)
+        # ── Methods — STRICT: methods section ONLY (Task 2) ──────────────────
+        if methods_text:
+            result.methods = _detect_methods(methods_text)
+            logger.debug("[%s] Methods from methods section: %s", source_file, result.methods)
+        else:
+            logger.debug("[%s] No methods section found — methods left empty", source_file)
 
-        # Metrics — only extract if paper likely reports them
-        if result.study_type in ("ML/DL classification", "Satellite flood mapping"):
-            result.oa    = _extract_metric(combined, OA_PATTERNS)
-            result.f1    = _extract_metric(combined, F1_PATTERNS)
-            result.iou   = _extract_metric(combined, IOU_PATTERNS)
-            result.kappa = _extract_metric(combined, KAPPA_PATTERNS)
+        # ── Metrics — STRICT: results section ONLY (Task 5) ──────────────────
+        if results_text and result.study_type in (
+            "ML/DL classification", "Satellite flood mapping", "Operational mapping system"
+        ):
+            result.oa    = _extract_metric(results_text, OA_PATTERNS)
+            result.f1    = _extract_metric(results_text, F1_PATTERNS)
+            result.iou   = _extract_metric(results_text, IOU_PATTERNS)
+            result.kappa = _extract_metric(results_text, KAPPA_PATTERNS)
+            logger.debug("[%s] Metrics from results section: OA=%s F1=%s IoU=%s K=%s",
+                         source_file, result.oa, result.f1, result.iou, result.kappa)
+        else:
+            logger.debug("[%s] No results section or non-metric paper — metrics left None",
+                         source_file)
 
-        # Timeliness
-        result.latency, result.revisit_time, result.near_real_time = _detect_timeliness(combined)
+        # ── Timeliness — abstract + methods ──────────────────────────────────
+        timeliness_text = f"{abstract_text} {methods_text}"
+        if not timeliness_text.strip():
+            timeliness_text = combined[:5000]
+        result.latency, result.revisit_time, result.near_real_time = _detect_timeliness(timeliness_text)
 
-        result.evidence   = _collect_evidence(combined)
-        result.confidence = _score_confidence(result)
+        # ── QA ────────────────────────────────────────────────────────────────
+        result.evidence       = _collect_evidence(results_text or combined[:5000])
+        result.confidence     = _score_confidence(result)
+        result.extractor_mode = "section" if has_sections else "fallback"
+        result.fallback_used  = not has_sections
+        result.llm_used       = False
+
+        if not has_sections:
+            logger.warning(
+                "[%s] No methods/results sections found — methods and metrics unavailable",
+                source_file,
+            )
 
         return result.finalize()
