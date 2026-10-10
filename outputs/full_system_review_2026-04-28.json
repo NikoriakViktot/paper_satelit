@@ -1,0 +1,149 @@
+{
+  "architecture_score": 4,
+  "code_quality_score": 5,
+  "scientific_validity_score": 3,
+  "scalability_score": 5,
+  "critical_issues": [
+    {
+      "issue": "Two independent section parser implementations create semantic drift and inconsistent section boundaries.",
+      "severity": "high",
+      "impact": "Different extractors run on different section segmentation logic, so the same paper can produce incompatible outputs and irreproducible metric extraction.",
+      "fix": "Unify on a single section parser module with one canonical contract and regression tests for heading variants."
+    },
+    {
+      "issue": "RegexExtractor extracts OA/F1/IoU/Kappa from full concatenated text, not results section.",
+      "severity": "high",
+      "impact": "Metrics can be pulled from Introduction/Related Work/Table captions and attributed as paper results.",
+      "fix": "Scope metric extraction to parsed Results section only and persist section provenance for each metric."
+    },
+    {
+      "issue": "SectionExtractor merges regex fallback outputs after LLM outputs, including metrics and methods.",
+      "severity": "high",
+      "impact": "A stricter section-based extraction can be silently overwritten/filled with weaker global regex signals.",
+      "fix": "Use provenance-aware merge policy: never downgrade section-scoped fields with global fallback values."
+    },
+    {
+      "issue": "Confidence scores are heuristic completeness scores, not calibrated correctness probabilities.",
+      "severity": "high",
+      "impact": "High confidence can be assigned to wrong rows, misleading downstream filtering and publication quality claims.",
+      "fix": "Calibrate confidence against labeled validation data, separate completeness from correctness, and report calibration error."
+    },
+    {
+      "issue": "Validation layer score threshold (min_score=2) can preserve low-integrity rows with only title+satellite.",
+      "severity": "high",
+      "impact": "Garbage rows survive filtering and pollute final dataset.",
+      "fix": "Introduce hard validation gates for metric provenance, section quality, and mandatory field combinations per study type."
+    },
+    {
+      "issue": "SectionExtractor sets constant confidence=0.90 regardless of extraction quality.",
+      "severity": "high",
+      "impact": "Confidence has no ranking meaning; weak and strong rows are indistinguishable.",
+      "fix": "Replace constant with feature-based calibrated score and confidence intervals."
+    },
+    {
+      "issue": "LLM call error handling swallows all exceptions and returns empty result objects.",
+      "severity": "medium",
+      "impact": "Silent degradation to fallback behavior makes failures hard to detect and audit.",
+      "fix": "Emit structured failure events, per-document status codes, and fail-fast option for quality-critical runs."
+    },
+    {
+      "issue": "Country detection uses keyword-first heuristics and post-hoc force-fill from full text.",
+      "severity": "medium",
+      "impact": "Region/country fields can be noisy (e.g., mentions in references or prior work sections).",
+      "fix": "Constrain geoparsing by section and context windows; require study-area evidence snippets."
+    },
+    {
+      "issue": "Pipeline scalability relies on full-context reconstruction for section extraction and multiple per-paper LLM calls.",
+      "severity": "medium",
+      "impact": "Throughput degrades for 300+ PDFs; LLM latency dominates and can stall batch completion.",
+      "fix": "Add async job queue, per-stage caching, and bounded parallelism with retry/backoff policies."
+    },
+    {
+      "issue": "No explicit dataset-level QA loop (gold set comparison, drift detection, or extraction regression suite).",
+      "severity": "medium",
+      "impact": "Scientific validity can regress unnoticed across code changes and corpus shifts.",
+      "fix": "Create benchmark corpus with expected outputs and run mandatory precision/recall checks in CI."
+    }
+  ],
+  "failure_modes": [
+    {
+      "scenario": "Paper reports baseline metrics in Introduction and no clear Results heading.",
+      "what_breaks": "RegexExtractor still extracts metrics from full text and marks metrics_reported=true.",
+      "why": "Metric regex is global-scope in RegexExtractor and not section-constrained."
+    },
+    {
+      "scenario": "LLM endpoint is unstable for part of a batch.",
+      "what_breaks": "Subset of papers silently downgrade to regex fallback with no hard failure signal.",
+      "why": "SectionExtractor catches broad Exception and returns empty result for merge/fallback path."
+    },
+    {
+      "scenario": "Heading style uses uncommon variants (e.g., 'Experimental Validation and Analysis').",
+      "what_breaks": "Results section is missed; metrics become null or taken from weak fallback.",
+      "why": "Heading pattern coverage is finite and differs between the two parser modules."
+    },
+    {
+      "scenario": "Methods mention many model names in survey context.",
+      "what_breaks": "Method list over-reports techniques as if used by the paper.",
+      "why": "Keyword-trigger method extraction lacks subject-action disambiguation and citation context filtering."
+    },
+    {
+      "scenario": "Geographic names appear only in references or related work examples.",
+      "what_breaks": "Country/region fields become false positives.",
+      "why": "Force-country detection scans broad text without study-area attribution constraints."
+    },
+    {
+      "scenario": "Large corpus with long documents and section extractor enabled.",
+      "what_breaks": "Runtime spikes and operational timeout risk increases sharply.",
+      "why": "Full-context retrieval + 3 LLM calls per document creates multiplicative latency."
+    }
+  ],
+  "improvements": [
+    {
+      "priority": "high",
+      "action": "Unify section parsing into one module and add fixture-based tests for 50+ heading patterns.",
+      "expected_gain": "Removes hidden coupling and improves reproducibility across extractor backends."
+    },
+    {
+      "priority": "high",
+      "action": "Attach provenance to every extracted field (section, sentence span, rule/model source).",
+      "expected_gain": "Enables auditable scientific claims and strict downstream filtering."
+    },
+    {
+      "priority": "high",
+      "action": "Constrain all metric extraction to validated Results spans and enforce section-level hard rules.",
+      "expected_gain": "Major reduction in false metric attribution and reviewer-facing errors."
+    },
+    {
+      "priority": "high",
+      "action": "Replace heuristic confidence with calibrated quality model on labeled corpus.",
+      "expected_gain": "Confidence becomes meaningful for triage and publication-grade filtering."
+    },
+    {
+      "priority": "high",
+      "action": "Add benchmark suite (gold annotations) with per-field precision/recall and fail thresholds in CI.",
+      "expected_gain": "Prevents silent quality drift and enforces scientific rigor over time."
+    },
+    {
+      "priority": "medium",
+      "action": "Refactor SectionExtractor merge strategy to avoid fallback overriding stricter section outputs.",
+      "expected_gain": "Reduces hidden contamination from weaker extraction layers."
+    },
+    {
+      "priority": "medium",
+      "action": "Implement async processing and retry budget for LLM stage with robust observability.",
+      "expected_gain": "Improves throughput and fault tolerance at 300+ PDF scale."
+    },
+    {
+      "priority": "medium",
+      "action": "Introduce study-type-specific validation schemas (required/forbidden fields).",
+      "expected_gain": "Filters structurally inconsistent rows before final export."
+    },
+    {
+      "priority": "low",
+      "action": "Normalize method extraction with context-aware patterns (used/applied vs mentioned/cited).",
+      "expected_gain": "Improves methodological precision for meta-analysis tasks."
+    }
+  ],
+  "final_verdict": "needs_major_revision",
+  "reviewer_comment": "This pipeline is not acceptable for publication-grade scientific dataset generation in its current form. The core extraction claims are undercut by non-calibrated confidence, inconsistent section parsing, and fallback pathways that can silently reintroduce weak global regex evidence into ostensibly section-constrained outputs. A Q1 reviewer would reject the dataset methodology due to insufficient provenance, weak validation design, and high risk of false metric attribution."
+}
